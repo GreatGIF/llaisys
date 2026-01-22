@@ -32,9 +32,16 @@ def test_op_linear(
         bias, bias_ = random_tensor((w_shape[0],), dtype_name, device_name)
 
     out, out_ = random_tensor(out_shape, dtype_name, device_name)
+    out2, _ = random_tensor(out_shape, dtype_name, device_name)
     torch_linear(out, x, w, bias)
+    # torch_linear(out2, x, w, torch.zeros(bias.shape))
+    # print("x:", x)
+    # print("w:", w)
+    # print("bias:", bias)
+    # print("without_bias:", out2)
     llaisys.Ops.linear(out_, x_, w_, bias_)
-
+    # print("llaisys:", out_.lib_tensor())
+    # print("torch:", out)
     assert check_equal(out_, out, atol=atol, rtol=rtol)
 
     if profile:
