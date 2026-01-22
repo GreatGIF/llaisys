@@ -164,27 +164,83 @@ void Tensor::debug() const {
 }
 
 bool Tensor::isContiguous() const {
-    TO_BE_IMPLEMENTED();
+    // TO_BE_IMPLEMENTED();
+    ptrdiff_t expected_stride = 1;
+    for (size_t i = _meta.shape.size()-1; i < _meta.shape.size(); i--) { // size_t是无符号整数
+        if (_meta.shape[i] == 1) {
+            continue;
+        }
+        if (_meta.strides[i] != expected_stride) {
+            return false;
+        }
+        expected_stride *= _meta.shape[i];
+    }
     return true;
 }
 
 tensor_t Tensor::permute(const std::vector<size_t> &order) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    // TO_BE_IMPLEMENTED();
+    // 张量的维度需要对应上
+    if (order.size() == _meta.shape.size()) {
+        TensorMeta new_meta;
+        new_meta.dtype = _meta.dtype;
+        new_meta.strides = std::vector<ptrdiff_t>(_meta.shape.size(), 0);
+        new_meta.shape = std::vector<size_t>(_meta.shape.size(), 0);
+        for (size_t i = 0; i < order.size(); i++) {
+            new_meta.shape[i] = _meta.shape[order[i]];
+            new_meta.strides[i] = _meta.strides[order[i]];
+        }
+        return std::shared_ptr<Tensor>(new Tensor(new_meta, _storage));
+    }
+    // return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    throw std::invalid_argument("The shape of order should be equal to tensor's.");
 }
 
 tensor_t Tensor::view(const std::vector<size_t> &shape) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    // TO_BE_IMPLEMENTED();
+    // 内存中需要连续
+    if (isContiguous()) {
+        size_t expected_stride = 1;
+        TensorMeta new_meta;
+        new_meta.dtype = _meta.dtype;
+        new_meta.shape = shape;
+        new_meta.strides = std::vector<ptrdiff_t>(shape.size(), 0);
+        for (size_t i = shape.size() - 1; i < shape.size(); i--) {
+            printf("111: %ld, stride: %ld\n", i, expected_stride);
+            new_meta.strides[i] = expected_stride;
+            expected_stride *= new_meta.shape[i];
+        }
+        return std::shared_ptr<Tensor>(new Tensor(new_meta, _storage));
+    }
+    // return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    throw std::invalid_argument("Only contiguous tensor can be viewed.");
 }
 
 tensor_t Tensor::slice(size_t dim, size_t start, size_t end) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    // TO_BE_IMPLEMENTED();
+    // 左闭右开
+    if (dim < _meta.shape.size() && start < _meta.shape[dim] && end <= _meta.shape[dim]) {
+        TensorMeta new_meta;
+        new_meta.dtype = _meta.dtype;
+        new_meta.shape = _meta.shape;
+        new_meta.strides = _meta.strides;
+        new_meta.shape[dim] = end - start;
+        size_t new_offset = _offset + start * new_meta.strides[dim] * elementSize();
+        return std::shared_ptr<Tensor>(new Tensor(new_meta, _storage, new_offset));
+    }
+    // return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    throw std::invalid_argument("The dim is out of range.");
 }
 
 void Tensor::load(const void *src_) {
-    TO_BE_IMPLEMENTED();
+    // TO_BE_IMPLEMENTED();
+    auto src = static_cast<const std::byte *>(src_);
+    core::context().setDevice(this->deviceType(), this->deviceId());
+    core::context().runtime().api()->memcpy_sync(
+        this->data(),
+        src,
+        this->numel() * this->elementSize(),
+        LLAISYS_MEMCPY_H2D);
 }
 
 tensor_t Tensor::contiguous() const {
