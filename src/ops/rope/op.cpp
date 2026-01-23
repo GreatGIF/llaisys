@@ -27,14 +27,22 @@ void rope_(T1* out, const T1* in, std::vector<size_t> in_shape, const T2* pos_id
             for (size_t k1 = 0; k1 < half_head_dim; k1++) {
                 size_t idx1 = (i * head_num + j) * head_dim + k1;
                 size_t idx2 = idx1 + half_head_dim;
+                float in1 = 0, in2 = 0;
                 if constexpr (std::is_same_v<T1, llaisys::bf16_t> || std::is_same_v<T1, llaisys::fp16_t>) {
-                    out[idx1] = llaisys::utils::cast<T1>(llaisys::utils::cast<float>(in[idx1]) * freqs_cos[i * half_head_dim + k1] 
-                        - llaisys::utils::cast<float>(in[idx2]) * freqs_sin[i * half_head_dim + k1]);
-                    out[idx2] = llaisys::utils::cast<T1>(llaisys::utils::cast<float>(in[idx1]) * freqs_sin[i * half_head_dim + k1] 
-                        + llaisys::utils::cast<float>(in[idx2]) * freqs_cos[i * half_head_dim + k1]);
+                    in1 = llaisys::utils::cast<float>(in[idx1]);
+                    in2 = llaisys::utils::cast<float>(in[idx2]);
                 } else {
-                    out[idx1] = in[idx1] * freqs_cos[i * half_head_dim + k1] - in[idx2] * freqs_sin[i * half_head_dim + k1];
-                    out[idx2] = in[idx1] * freqs_sin[i * half_head_dim + k1] + in[idx2] * freqs_cos[i * half_head_dim + k1];
+                    in1 = in[idx1];
+                    in2 = in[idx2];
+                }
+                if constexpr (std::is_same_v<T1, llaisys::bf16_t> || std::is_same_v<T1, llaisys::fp16_t>) {
+                    out[idx1] = llaisys::utils::cast<T1>(in1* freqs_cos[i * half_head_dim + k1] 
+                        - in2 * freqs_sin[i * half_head_dim + k1]);
+                    out[idx2] = llaisys::utils::cast<T1>(in1 * freqs_sin[i * half_head_dim + k1] 
+                        + in2 * freqs_cos[i * half_head_dim + k1]);
+                } else {
+                    out[idx1] = in1 * freqs_cos[i * half_head_dim + k1] - in2 * freqs_sin[i * half_head_dim + k1];
+                    out[idx2] = in1 * freqs_sin[i * half_head_dim + k1] + in2 * freqs_cos[i * half_head_dim + k1];
                 }
             }
         }

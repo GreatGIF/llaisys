@@ -48,8 +48,10 @@ def test_op_rope(
     y, y_ = random_tensor(shape, dtype_name, device_name)
     torch_rope(y, x, pos_ids, theta)
     llaisys.Ops.rope(y_, x_, pos_ids_, theta)
+    llaisys.Ops.rope(x_, x_, pos_ids_, theta)
 
     assert check_equal(y_, y, atol=atol, rtol=rtol)
+    assert check_equal(x_, y, atol=atol, rtol=rtol)
 
     if profile:
         benchmark(
