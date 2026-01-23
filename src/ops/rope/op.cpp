@@ -44,7 +44,7 @@ void rope_(T1* out, const T1* in, std::vector<size_t> in_shape, const T2* pos_id
 namespace llaisys::ops {
 void rope(tensor_t out, tensor_t in, tensor_t pos_ids, float theta) {
     // TO_BE_IMPLEMENTED();
-    if (out->shape().size() != 3) {
+    if (out->ndim() != 3) {
         throw std::invalid_argument("rope: out must be a 3D tensor.");
     }
     if (out->shape()[2] % 2 != 0) {

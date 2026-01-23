@@ -24,7 +24,7 @@ void swiglu_(T *out, const T *gate, const T *up, const std::vector<size_t> &shap
 namespace llaisys::ops {
 void swiglu(tensor_t out, tensor_t gate, tensor_t up) {
     // TO_BE_IMPLEMENTED();
-    if (up->shape().size() != gate->shape().size() || up->shape().size() != out->shape().size() || up->shape().size() != 2) {
+    if (up->ndim() != gate->ndim() || up->ndim() != out->ndim() || up->ndim() != 2) {
         throw std::invalid_argument("The shape of gate, up and out should be equal to 2.");
     }
     if (up->shape()[0] != gate->shape()[0] || up->shape()[1] != gate->shape()[1]) {

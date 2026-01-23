@@ -60,12 +60,9 @@ void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
     if (in->dtype() != out->dtype()) {
         throw std::invalid_argument("linear: in and out must have the same dtype");
     }
-    if (bias->dtype() != out->dtype()) {
-        throw std::invalid_argument("linear: bias and out must have the same dtype");
-    }
 
     llaisysDataType_t type = in->dtype();
-    bool is_bias = bias->numel() > 0;
+    bool is_bias = bias != nullptr;
     switch (type) {
     case LLAISYS_DTYPE_F32:
         linear_(reinterpret_cast<float *>(out->data()), reinterpret_cast<const float *>(in->data()), 
