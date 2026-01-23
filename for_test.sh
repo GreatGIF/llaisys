@@ -13,4 +13,4 @@ pip install -e ./python/
 
 # python "$script_name"
 
-python test/test_infer.py --model /mnt/d/model/Qwen2.5-0.5B/ --test
+python test/test_infer.py --model /mnt/d/model/Qwen2.5-1.5B/ --test

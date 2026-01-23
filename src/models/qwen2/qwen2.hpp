@@ -18,6 +18,7 @@ private:
     LlaisysQwen2Weights _weights_c;
     
     // Storage for weight tensors to keep shared_ptr alive
+    // device tensor
     tensor_t _in_embed;
     tensor_t _out_embed;
     tensor_t _out_norm_w;
@@ -46,15 +47,20 @@ private:
     size_t _cur_pos = 0;
 
     // 提前创建中间结果的tensor, 通过复用以减少infer时的内存开销
+    // device tensor
     tensor_t _x;               // [ntoken, hs]
     tensor_t _x_norm;          // [ntoken, hs]
     tensor_t _q, _k, _v;       // [ntoken, nh/nkvh, dh] - after RoPE
     tensor_t _attn_out;        // [ntoken, nh, dh]
     tensor_t _attn_proj;       // [ntoken, hs]
+    tensor_t _x_norm_mlp;      // [ntoken, hs]
     tensor_t _mlp_gate, _mlp_up; // [ntoken, di]
+    tensor_t _mlp_gate_out;    // [ntoken, di]
+    tensor_t _mlp_down_out;    // [ntoken, hs]
+    tensor_t _x_last_norm;      // [1, hs]
     tensor_t _logits;          // [ntoken, voc]
-    tensor_t _next_token;      // [1]
-    tensor_t _max_val;         // [1]
+    // tensor_t _next_token;      // [1]
+    // tensor_t _max_val;         // [1]
     
     // Device info
     llaisysDeviceType_t _device_type;

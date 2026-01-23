@@ -96,6 +96,25 @@ Qwen2Model::Qwen2Model(const LlaisysQwen2Meta &meta, llaisysDeviceType_t device,
         _k_cache[i] = create_weight({_meta.maxseq, _meta.nkvh, _meta.dh});
         _v_cache[i] = create_weight({_meta.maxseq, _meta.nkvh, _meta.dh});
     }
+
+    // 预分配中间Tensor变量, 通过复用以减少重复创建Tensor
+    _x = create_weight({_meta.maxseq, _meta.hs});
+    _x_norm = create_weight({_meta.maxseq, _meta.hs});
+    _q = create_weight({_meta.maxseq, _meta.nh, _meta.dh});
+    _k = create_weight({_meta.maxseq, _meta.nkvh, _meta.dh});
+    _v = create_weight({_meta.maxseq, _meta.nkvh, _meta.dh});
+    _attn_out = create_weight({_meta.maxseq, _meta.nh, _meta.dh});
+    _attn_proj = create_weight({_meta.maxseq, _meta.hs});
+    _x_norm_mlp = create_weight({_meta.maxseq, _meta.hs});
+    _mlp_gate = create_weight({_meta.maxseq, _meta.di});
+    _mlp_up = create_weight({_meta.maxseq, _meta.di});
+    _mlp_gate_out = create_weight({_meta.maxseq, _meta.di});
+    _mlp_down_out = create_weight({_meta.maxseq, _meta.hs});
+    _x_last_norm = create_weight({1, _meta.hs});
+    _logits = create_weight({1, _meta.voc});
+    // _next_token = Tensor::create({1}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU, 0);
+    // _max_val = Tensor::create({1}, _meta.dtype, LLAISYS_DEVICE_CPU, 0);
+
 }
 
 Qwen2Model::~Qwen2Model() {
@@ -121,9 +140,9 @@ int64_t Qwen2Model::infer(int64_t *token_ids, size_t ntoken) {
     // _out_embed->slice(0, 1, 10)->debug();
     // exit(1);
 
-    auto create_tmp = [&](const std::vector<size_t> &shape) {
-        return Tensor::create(shape, _meta.dtype, _device_type, _device_id);
-    };
+    // auto create_tmp = [&](const std::vector<size_t> &shape) {
+    //     return Tensor::create(shape, _meta.dtype, _device_type, _device_id);
+    // };
 
     const LlaisysRuntimeAPI *api = device::getRuntimeAPI(_device_type);
 
@@ -140,7 +159,8 @@ int64_t Qwen2Model::infer(int64_t *token_ids, size_t ntoken) {
     }
 
     // 2. Embedding
-    auto x = create_tmp({ntoken, _meta.hs});
+    // auto x = create_tmp({ntoken, _meta.hs});
+    auto x = _x->view({ntoken, _meta.hs});
     ops::embedding(x, tokens_device, _in_embed);
 
     // 3. Position IDs for RoPE
@@ -162,21 +182,28 @@ int64_t Qwen2Model::infer(int64_t *token_ids, size_t ntoken) {
         auto residual = x;
 
         // Norm
-        auto x_norm = create_tmp({ntoken, _meta.hs});
+        // auto x_norm = create_tmp({ntoken, _meta.hs});
+        auto x_norm = _x_norm->view({ntoken, _meta.hs});
         ops::rms_norm(x_norm, x, _attn_norm_w[i], _meta.epsilon);
 
         // QKV Projections
-        auto q = create_tmp({ntoken, _meta.nh, _meta.dh});
-        auto k = create_tmp({ntoken, _meta.nkvh, _meta.dh});
-        auto v = create_tmp({ntoken, _meta.nkvh, _meta.dh});
+        // auto q = create_tmp({ntoken, _meta.nh, _meta.dh});
+        // auto k = create_tmp({ntoken, _meta.nkvh, _meta.dh});
+        // auto v = create_tmp({ntoken, _meta.nkvh, _meta.dh});
+        auto q = _q->view({ntoken, _meta.nh, _meta.dh});
+        auto k = _k->view({ntoken, _meta.nkvh, _meta.dh});
+        auto v = _v->view({ntoken, _meta.nkvh, _meta.dh});
 
         ops::linear(q->view({ntoken, _meta.nh * _meta.dh}), x_norm, _attn_q_w[i], _attn_q_b[i]);
         ops::linear(k->view({ntoken, _meta.nkvh * _meta.dh}), x_norm, _attn_k_w[i], _attn_k_b[i]);
         ops::linear(v->view({ntoken, _meta.nkvh * _meta.dh}), x_norm, _attn_v_w[i], _attn_v_b[i]);
 
         // RoPE
-        auto q_rope = create_tmp({ntoken, _meta.nh, _meta.dh});
-        auto k_rope = create_tmp({ntoken, _meta.nkvh, _meta.dh});
+        // auto q_rope = create_tmp({ntoken, _meta.nh, _meta.dh});
+        // auto k_rope = create_tmp({ntoken, _meta.nkvh, _meta.dh});
+        // in place
+        auto q_rope = q;
+        auto k_rope = k;
         ops::rope(q_rope, q, pos_ids, _meta.theta);
         ops::rope(k_rope, k, pos_ids, _meta.theta);
 
@@ -193,53 +220,66 @@ int64_t Qwen2Model::infer(int64_t *token_ids, size_t ntoken) {
         auto v_full = _v_cache[i]->slice(0, 0, _cur_pos + ntoken);
 
         // Multi-head Attention
-        auto attn_out = create_tmp({ntoken, _meta.nh, _meta.dh});
+        // auto attn_out = create_tmp({ntoken, _meta.nh, _meta.dh});
+        auto attn_out = _attn_out->view({ntoken, _meta.nh, _meta.dh});
         ops::self_attention(attn_out, q_rope, k_full, v_full, 1.0f / sqrtf(_meta.dh));
 
         // Output Projection
-        auto attn_proj = create_tmp({ntoken, _meta.hs});
+        // auto attn_proj = create_tmp({ntoken, _meta.hs})
+        auto attn_proj = _attn_proj->view({ntoken, _meta.hs});
         ops::linear(attn_proj, attn_out->view({ntoken, _meta.nh * _meta.dh}), _attn_o_w[i], nullptr);
 
         // Add
-        auto x_new = create_tmp({ntoken, _meta.hs});
-        ops::add(x_new, residual, attn_proj);
-        x = x_new;
+        // auto x_new = create_tmp({ntoken, _meta.hs});
+        // ops::add(x_new, residual, attn_proj);
+        // x = x_new;
+        // add支持inplace
+        ops::add(x, residual, attn_proj);
 
         // MLP
         residual = x;
-        auto x_norm_mlp = create_tmp({ntoken, _meta.hs});
+        // auto x_norm_mlp = create_tmp({ntoken, _meta.hs});
+        auto x_norm_mlp = _x_norm_mlp->view({ntoken, _meta.hs});
         ops::rms_norm(x_norm_mlp, x, _mlp_norm_w[i], _meta.epsilon);
 
-        auto gate = create_tmp({ntoken, _meta.di});
-        auto up = create_tmp({ntoken, _meta.di});
+        // auto gate = create_tmp({ntoken, _meta.di});
+        // auto up = create_tmp({ntoken, _meta.di});
+        auto gate = _mlp_gate->view({ntoken, _meta.di});
+        auto up = _mlp_up->view({ntoken, _meta.di});
         ops::linear(gate, x_norm_mlp, _mlp_gate_w[i], nullptr);
         ops::linear(up, x_norm_mlp, _mlp_up_w[i], nullptr);
 
-        auto mlp_gate_out = create_tmp({ntoken, _meta.di});
+        // auto mlp_gate_out = create_tmp({ntoken, _meta.di});
+        auto mlp_gate_out = _mlp_gate_out->view({ntoken, _meta.di});
         ops::swiglu(mlp_gate_out, gate, up);
 
-        auto mlp_down_out = create_tmp({ntoken, _meta.hs});
+        // auto mlp_down_out = create_tmp({ntoken, _meta.hs});
+        auto mlp_down_out = _mlp_down_out->view({ntoken, _meta.hs});
         ops::linear(mlp_down_out, mlp_gate_out, _mlp_down_w[i], nullptr);
 
-        auto x_final = create_tmp({ntoken, _meta.hs});
-        ops::add(x_final, residual, mlp_down_out);
-        x = x_final;
+        // auto x_final = create_tmp({ntoken, _meta.hs});
+        // ops::add(x_final, residual, mlp_down_out);
+        // x = x_final;
+        // add支持inplace
+        ops::add(x, residual, mlp_down_out);
     }
 
     _cur_pos += ntoken;
 
     // 5. Final Norm & LM Head (only for the last token)
     auto x_last = x->slice(0, ntoken - 1, ntoken);
-    auto x_last_norm = create_tmp({1, _meta.hs});
+    // auto x_last_norm = create_tmp({1, _meta.hs});
+    auto x_last_norm = _x_last_norm;
     ops::rms_norm(x_last_norm, x_last, _out_norm_w, _meta.epsilon);
 
-    auto logits = create_tmp({1, _meta.voc});
+    // auto logits = create_tmp({1, _meta.voc});
+    auto logits = _logits;
     ops::linear(logits, x_last_norm, _out_embed, nullptr);
 
     // 6. Argmax
     auto next_token_idx = Tensor::create({1}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU, 0);
     auto max_val = Tensor::create({1}, _meta.dtype, LLAISYS_DEVICE_CPU, 0);
-    
+
     // Argmax expects input on CPU usually if labels are on CPU
     if (_device_type == LLAISYS_DEVICE_CPU) {
         ops::argmax(next_token_idx, max_val, logits->view({_meta.voc}));
