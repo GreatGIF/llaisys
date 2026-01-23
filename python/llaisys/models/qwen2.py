@@ -1,6 +1,12 @@
 from typing import Sequence
+import json
+import numpy as np
+import ctypes
+import torch
 from ..libllaisys import LIB_LLAISYS
-from ..libllaisys import DeviceType
+from ..libllaisys import DeviceType, DataType
+from ..libllaisys.models import LlaisysQwen2Meta
+from ..tensor import Tensor
 
 from pathlib import Path
 import safetensors
@@ -9,25 +15,120 @@ import safetensors
 class Qwen2:
 
     def __init__(self, model_path, device: DeviceType = DeviceType.CPU):
-        # TODO: Implement model constructor
-
         model_path = Path(model_path)
+        with open(model_path / "config.json", "r") as f:
+            config = json.load(f)
 
+        # 从qwen2的config.json中解析参数, 构造LlaisysQwen2Meta
+        meta = LlaisysQwen2Meta()
+        meta.dtype = DataType.BF16                              # DeepSeek R1 uses BF16
+        meta.nlayer = config["num_hidden_layers"]
+        meta.hs = config["hidden_size"]
+        meta.nh = config["num_attention_heads"]
+        meta.nkvh = config.get("num_key_value_heads", meta.nh)
+        meta.dh = meta.hs // meta.nh                            # hidden size per head
+        meta.di = config["intermediate_size"]
+        meta.maxseq = config.get("max_position_embeddings", 131072)
+        meta.voc = config["vocab_size"]
+        meta.epsilon = config.get("rms_norm_eps", 1e-6)
+        meta.theta = config.get("rope_theta", 1000000.0)
+        meta.end_token = config.get("eos_token_id", 151643)
+        self.end_token = meta.end_token
+        self.tied = config.get("tie_word_embeddings", False)
+        # print(f"[llaisys] Tied: {self.tied}, config.tied: {config['tie_word_embeddings']}")
+
+        # 创建c++后端的模型并将指针绑定到self._model
+        device_ids = (ctypes.c_int * 1)(0)          # 只支持一个cpu设备
+        self._model = LIB_LLAISYS.llaisysQwen2ModelCreate(
+            ctypes.byref(meta),
+            device,
+            device_ids,
+            1
+        )
+
+        # 通过LlaisysQwen2Weights的结构体指针, 获取c++后端创建的权重tensor的指针
+        weights_ptr = LIB_LLAISYS.llaisysQwen2ModelWeights(self._model)
+        weights = weights_ptr.contents
+
+        # 通过map, 将safetensors的key和c++后端的权重tensor对应起来
+        name_map = {
+            "model.embed_tokens.weight": weights.in_embed,
+            "lm_head.weight": weights.out_embed,
+            "model.norm.weight": weights.out_norm_w,
+        }
+        for i in range(meta.nlayer):
+            name_map[f"model.layers.{i}.input_layernorm.weight"] = weights.attn_norm_w[i]
+            name_map[f"model.layers.{i}.self_attn.q_proj.weight"] = weights.attn_q_w[i]
+            name_map[f"model.layers.{i}.self_attn.k_proj.weight"] = weights.attn_k_w[i]
+            name_map[f"model.layers.{i}.self_attn.v_proj.weight"] = weights.attn_v_w[i]
+            name_map[f"model.layers.{i}.self_attn.q_proj.bias"] = weights.attn_q_b[i]
+            name_map[f"model.layers.{i}.self_attn.k_proj.bias"] = weights.attn_k_b[i]
+            name_map[f"model.layers.{i}.self_attn.v_proj.bias"] = weights.attn_v_b[i]
+            name_map[f"model.layers.{i}.self_attn.o_proj.weight"] = weights.attn_o_w[i]
+            name_map[f"model.layers.{i}.post_attention_layernorm.weight"] = weights.mlp_norm_w[i]
+            name_map[f"model.layers.{i}.mlp.gate_proj.weight"] = weights.mlp_gate_w[i]
+            name_map[f"model.layers.{i}.mlp.up_proj.weight"] = weights.mlp_up_w[i]
+            name_map[f"model.layers.{i}.mlp.down_proj.weight"] = weights.mlp_down_w[i]
+           
+        # 从safetensors中加载权重, 通过map, 将权重加载到c++后端的权重tensor
         for file in sorted(model_path.glob("*.safetensors")):
-            data_ = safetensors.safe_open(file, framework="numpy", device="cpu")
-            for name_ in data_.keys():
-                ## TODO: load the model weights
-                pass
+            with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+                for name in f.keys():
+                    if name in name_map:
+                        data = f.get_tensor(name)
+                        ptr = data.data_ptr()
+                        # 使用Tensor类在销毁的时候会自动释放tensor的指针
+                        # 而这里的tensor指针同时也由c++后端的Qwen2Model管理, 析构函数中会二次释放
+                        # 所以不使用Tensor类, 直接使用c++后端的指针, 避免double free
+                        if name == "model.embed_tokens.weight" and self.tied: # Tied embeddings
+                            # print("[llaisys] Tied embeddings, loading lm_head.weight to out_embed")
+                            # out_embed = Tensor(tensor=weights.out_embed)
+                            # out_embed.load(ctypes.c_void_p(ptr))
+                            LIB_LLAISYS.tensorLoad(weights.out_embed, ctypes.c_void_p(ptr))
+                        # t = Tensor(tensor=name_map[name])
+                        # t.load(ctypes.c_void_p(ptr))
+                        # print(f"[llaisys] Loading weight: {name} to {t}")
+                        LIB_LLAISYS.tensorLoad(name_map[name], ctypes.c_void_p(ptr))
+                    else:
+                        print(f"Skipping unknown weight: {name}")
+
+    def __del__(self):
+        if hasattr(self, "_model") and self._model:
+            LIB_LLAISYS.llaisysQwen2ModelDestroy(self._model)
+            self._model = None
 
     def generate(
         self,
         inputs: Sequence[int],
-        max_new_tokens: int = None,
-        top_k: int = 1,
-        top_p: float = 0.8,
-        temperature: float = 0.8,
+        max_new_tokens: int = 120,
+        top_k: int = 1,             # not used
+        top_p: float = 0.8,         # not used
+        temperature: float = 0.8,   # not used
     ):
+        output_tokens = []
+        curr_inputs = list(inputs)
+        output_tokens.extend(curr_inputs)
+        # print(f"Input tokens: {curr_inputs}")
+        
+        # 推理
+        for _ in range(max_new_tokens or 2048):
+            token_ids = (ctypes.c_int64 * len(curr_inputs))(*curr_inputs)
+            
+            # Infer next token
+            next_token = LIB_LLAISYS.llaisysQwen2ModelInfer(
+                self._model,
+                token_ids,
+                ctypes.c_size_t(len(curr_inputs))
+            )
+            
+            output_tokens.append(int(next_token))
+            
+            # 检测end_token
+            if next_token == self.end_token:
+                break
+            
+            # 实现KV cache的时候, 只需传入最新的token
+            # todo: KV cache超出的时候, 需要传入历史的token
+            curr_inputs = [next_token]
 
-        # TODO: Implement generate function
-
-        return []
+        return output_tokens

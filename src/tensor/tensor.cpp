@@ -206,7 +206,6 @@ tensor_t Tensor::view(const std::vector<size_t> &shape) const {
         new_meta.shape = shape;
         new_meta.strides = std::vector<ptrdiff_t>(shape.size(), 0);
         for (size_t i = shape.size() - 1; i < shape.size(); i--) {
-            printf("111: %ld, stride: %ld\n", i, expected_stride);
             new_meta.strides[i] = expected_stride;
             expected_stride *= new_meta.shape[i];
         }
@@ -254,8 +253,24 @@ tensor_t Tensor::reshape(const std::vector<size_t> &shape) const {
 }
 
 tensor_t Tensor::to(llaisysDeviceType_t device_type, int device) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    // 1. 创建目标设备上的新张量
+    auto new_tensor = create(this->shape(), this->dtype(), device_type, device);
+    
+    // 2. 根据方向执行 memcpy (H2D, D2H, D2D)
+    llaisysMemcpyKind_t kind;
+    if (this->deviceType() == LLAISYS_DEVICE_CPU && device_type != LLAISYS_DEVICE_CPU) {
+        kind = LLAISYS_MEMCPY_H2D;
+    } else if (this->deviceType() != LLAISYS_DEVICE_CPU && device_type == LLAISYS_DEVICE_CPU) {
+        kind = LLAISYS_MEMCPY_D2H;
+    } else {
+        kind = LLAISYS_MEMCPY_D2D;
+    }
+
+    core::context().runtime().api()->memcpy_sync(
+        new_tensor->data(), this->data(), 
+        this->numel() * this->elementSize(), kind);
+    
+    return new_tensor;
 }
 
 } // namespace llaisys
