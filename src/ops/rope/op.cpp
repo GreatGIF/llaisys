@@ -15,7 +15,7 @@ void rope_(T1* out, const T1* in, std::vector<size_t> in_shape, const T2* pos_id
             if constexpr (std::is_same_v<T1, llaisys::bf16_t> || std::is_same_v<T1, llaisys::fp16_t>) {
                 curr_pos_id = llaisys::utils::cast<float>(pos_ids[i]);
             } else {
-                curr_pos_id = pos_ids[i];
+                curr_pos_id = static_cast<float>(pos_ids[i]);
             }
             float freqs = curr_pos_id / std::pow(theta, static_cast<float>(2 * j) / static_cast<float>(head_dim));
             freqs_sin[i * half_head_dim + j] = sin(freqs);

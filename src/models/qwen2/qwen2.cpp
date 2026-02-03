@@ -222,7 +222,7 @@ int64_t Qwen2Model::infer(int64_t *token_ids, size_t ntoken) {
         // Multi-head Attention
         // auto attn_out = create_tmp({ntoken, _meta.nh, _meta.dh});
         auto attn_out = _attn_out->view({ntoken, _meta.nh, _meta.dh});
-        ops::self_attention(attn_out, q_rope, k_full, v_full, 1.0f / sqrtf(_meta.dh));
+        ops::self_attention(attn_out, q_rope, k_full, v_full, 1.0f / sqrtf(static_cast<float>(_meta.dh)));
 
         // Output Projection
         // auto attn_proj = create_tmp({ntoken, _meta.hs})
