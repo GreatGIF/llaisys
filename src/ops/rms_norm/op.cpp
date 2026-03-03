@@ -6,6 +6,9 @@ void rms_norm_(T* out, const T* in, const T* weight, const std::vector<size_t> &
     size_t m = shape[0];
     size_t n = shape[1];
     std::vector<float> sum(m, 0);
+#ifdef ENABLE_OPENMP
+    #pragma omp parallel for schedule(static) if (m >= 16)
+#endif
     for (size_t i = 0; i < m; i++) {
         for (size_t j = 0; j < n; j++) {
             float x = llaisys::utils::cast<float>(in[i * n + j]);
@@ -13,7 +16,9 @@ void rms_norm_(T* out, const T* in, const T* weight, const std::vector<size_t> &
         }
         sum[i] = std::sqrt(sum[i] / static_cast<float>(n) + eps);
     }
-
+#ifdef ENABLE_OPENMP
+    #pragma omp parallel for schedule(static) if (m >= 16)
+#endif
     for (size_t i = 0; i < m; i++) {
         for (size_t j = 0; j < n; j++) {
             if constexpr (std::is_same_v<T, llaisys::bf16_t> || std::is_same_v<T, llaisys::fp16_t>) {

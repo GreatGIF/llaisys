@@ -13,9 +13,36 @@ option("nv-gpu")
     set_description("Whether to compile implementations for Nvidia GPU")
 option_end()
 
+option("openmp")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Enable OpenMP parallelization for CPU operators")
+option_end()
+
 if has_config("nv-gpu") then
     add_defines("ENABLE_NVIDIA_API")
     includes("xmake/nvidia.lua")
+end
+
+if has_config("openmp") then
+    add_defines("ENABLE_OPENMP")
+    if not is_plat("windows") then
+        if is_plat("linux") then
+            add_cxflags("-fopenmp")
+            local sys_libgomp = "/lib/x86_64-linux-gnu/libgomp.so.1"
+            if os.isfile(sys_libgomp) then
+                add_ldflags(sys_libgomp, {force = true})
+                add_shflags(sys_libgomp, {force = true})
+            else
+                add_ldflags("-fopenmp")
+                add_shflags("-fopenmp")
+            end
+        else
+            add_cxflags("-fopenmp")
+            add_ldflags("-fopenmp")
+            add_shflags("-fopenmp")
+        end
+    end
 end
 
 target("llaisys-utils")

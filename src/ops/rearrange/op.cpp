@@ -8,6 +8,9 @@ void rearrange_(T* out, const T* in, const std::vector<size_t> &shape, const std
         total_elems *= shape[i];
     }
 
+#ifdef ENABLE_OPENMP
+    #pragma omp parallel for schedule(static) if (total_elems >= 4096)
+#endif
     for (size_t i = 0; i < total_elems; i++) {
         ptrdiff_t out_offset = 0, in_offset = 0;
         for (size_t j = 0; j < ndim; j++) {

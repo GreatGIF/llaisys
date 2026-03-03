@@ -9,19 +9,25 @@ void rope_(T1* out, const T1* in, std::vector<size_t> in_shape, const T2* pos_id
     size_t half_head_dim = head_dim / 2;
     std::vector<float> freqs_sin(seq_len * half_head_dim, 0);
     std::vector<float> freqs_cos(seq_len * half_head_dim, 0);
+#ifdef ENABLE_OPENMP
+    #pragma omp parallel for schedule(static) if (seq_len >= 16)
+#endif
     for (size_t i = 0; i < seq_len; i++) {
+        float curr_pos_id;
+        if constexpr (std::is_same_v<T1, llaisys::bf16_t> || std::is_same_v<T1, llaisys::fp16_t>) {
+            curr_pos_id = llaisys::utils::cast<float>(pos_ids[i]);
+        } else {
+            curr_pos_id = static_cast<float>(pos_ids[i]);
+        }
         for (size_t j = 0; j < half_head_dim; j++) {
-            float curr_pos_id;
-            if constexpr (std::is_same_v<T1, llaisys::bf16_t> || std::is_same_v<T1, llaisys::fp16_t>) {
-                curr_pos_id = llaisys::utils::cast<float>(pos_ids[i]);
-            } else {
-                curr_pos_id = static_cast<float>(pos_ids[i]);
-            }
             float freqs = curr_pos_id / std::pow(theta, static_cast<float>(2 * j) / static_cast<float>(head_dim));
             freqs_sin[i * half_head_dim + j] = sin(freqs);
             freqs_cos[i * half_head_dim + j] = cos(freqs);
         }
     }
+#ifdef ENABLE_OPENMP
+    #pragma omp parallel for collapse(2) schedule(static) if (seq_len * head_num >= 16)
+#endif
     for (size_t i = 0; i < seq_len; i++) {
         for (size_t j = 0; j < head_num; j++) {
             for (size_t k1 = 0; k1 < half_head_dim; k1++) {

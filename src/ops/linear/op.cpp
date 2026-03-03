@@ -2,6 +2,9 @@
 
 template <typename T>
 void linear_(T* out, const T* in, const T* weight, const T* bias, const size_t M, const size_t N, const size_t K) {
+#ifdef ENABLE_OPENMP
+    #pragma omp parallel for collapse(2) schedule(static) if (M * N >= 256)
+#endif
     for (size_t m = 0; m < M; m++) {
         for (size_t n = 0; n < N; n++) {
             // 使用fp32累加

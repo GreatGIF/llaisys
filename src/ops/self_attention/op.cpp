@@ -11,6 +11,9 @@ void self_attention_(T* attn_val, const T* q, const T* k, const T* v, const std:
     size_t ng = nh / nkvh;  // groups
     std::vector<float> attn_score(nh*qlen*kvlen, 0); // [head, ql, kvl]
 
+#ifdef ENABLE_OPENMP
+    #pragma omp parallel for collapse(4) schedule(static) if (nkvh * ng * qlen * kvlen >= 256)
+#endif
     // Q * K^T [head, ql, kvl]
     for (size_t head1 = 0; head1 < nkvh; head1++) {
         for (size_t head2 = 0; head2 < ng; head2++) {
@@ -37,6 +40,9 @@ void self_attention_(T* attn_val, const T* q, const T* k, const T* v, const std:
 
 
     // safe softmax 减去最大值
+#ifdef ENABLE_OPENMP
+    #pragma omp parallel for collapse(2) schedule(static) if (nh * qlen >= 128)
+#endif
     for (size_t head = 0; head < nh; head++) {
         for (size_t ql = 0; ql < qlen; ql++) {
             float max_val = -std::numeric_limits<float>::infinity();
@@ -59,6 +65,10 @@ void self_attention_(T* attn_val, const T* q, const T* k, const T* v, const std:
         }
     }
 
+    // Q * K^T * V [head, ql, d]
+#ifdef ENABLE_OPENMP
+    #pragma omp parallel for collapse(4) schedule(static) if (nkvh * ng * qlen * hd >= 256)
+#endif
     for (size_t head1 = 0; head1 < nkvh; head1++) {
         for (size_t head2 = 0; head2 < ng; head2++) {
             for (size_t ql = 0; ql < qlen; ql++) {

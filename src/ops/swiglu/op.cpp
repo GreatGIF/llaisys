@@ -5,6 +5,9 @@ template <typename T>
 void swiglu_(T *out, const T *gate, const T *up, const std::vector<size_t> &shape) {
     size_t seq_len = shape[0];
     size_t hid_dim = shape[1];
+#ifdef ENABLE_OPENMP
+    #pragma omp parallel for collapse(2) schedule(static) if (seq_len * hid_dim >= 256)
+#endif
     for (size_t i = 0; i < seq_len; i++) {
         for (size_t j = 0; j < hid_dim; j++) {
             float gate_val = 0, up_val = 0;

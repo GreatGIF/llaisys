@@ -2,6 +2,9 @@
 
 template <typename T1, typename T2>
 void embedding_(T1* out, const T2* index, const T1* weight, size_t index_size, size_t row_size) {
+#ifdef ENABLE_OPENMP
+    #pragma omp parallel for schedule(static) if (index_size >= 4096)
+#endif
     for (size_t i = 0; i < index_size; i++) {
         for (size_t j = 0; j < row_size; j++) {
             out[i * row_size + j] = weight[index[i] * row_size + j];
