@@ -1,7 +1,8 @@
 set -e
+xmake f -c --openmp=true
 xmake
 xmake install
-pip install -e ./python/
+# pip install -e ./python/
 # pip install ./python/
 
 # script_name="test/$1.py"
@@ -13,4 +14,4 @@ pip install -e ./python/
 
 # python "$script_name"
 
-python test/test_infer.py --model /mnt/d/model/Qwen2.5-1.5B/ --test
+# python test/test_infer.py --model /mnt/d/model/Qwen2.5-1.5B/ --test

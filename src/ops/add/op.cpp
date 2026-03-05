@@ -13,10 +13,10 @@ void add(tensor_t c, tensor_t a, tensor_t b) {
     CHECK_SAME_DTYPE(c->dtype(), a->dtype(), b->dtype());
     ASSERT(c->isContiguous() && a->isContiguous() && b->isContiguous(), "Add: all tensors must be contiguous.");
 
-    // always support cpu calculation
-    if (c->deviceType() == LLAISYS_DEVICE_CPU) {
-        return cpu::add(c->data(), a->data(), b->data(), c->dtype(), c->numel());
-    }
+    // // always support cpu calculation
+    // if (c->deviceType() == LLAISYS_DEVICE_CPU) {
+    //     return cpu::add(c->data(), a->data(), b->data(), c->dtype(), c->numel());
+    // }
 
     llaisys::core::context().setDevice(c->deviceType(), c->deviceId());
 
