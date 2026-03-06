@@ -25,6 +25,18 @@ option("cpu-blas")
     set_description("Enable BLAS backend (OpenBLAS) for CPU linear operator")
 option_end()
 
+option("cpu-onednn")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Enable oneDNN backend for CPU linear operator")
+option_end()
+
+option("cpu-mkl")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Enable Intel MKL backend for CPU linear operator")
+option_end()
+
 if has_config("nv-gpu") then
     add_defines("ENABLE_NVIDIA_API")
     includes("xmake/nvidia.lua")
@@ -52,9 +64,42 @@ if has_config("openmp") then
 end
 
 if has_config("cpu-blas") then
-    add_defines("LLAISYS_ENABLE_CPU_BLAS")
+    add_defines("ENABLE_CPU_BLAS")
     if is_plat("linux") then
         add_links("openblas")
+    end
+end
+
+if has_config("cpu-onednn") then
+    add_defines("ENABLE_CPU_ONEDNN")
+    if is_plat("linux") then
+        add_links("dnnl")
+    end
+end
+
+if has_config("cpu-mkl") then
+    add_defines("ENABLE_CPU_MKL")
+    -- add_defines("MKL_HAS_HGEMM") -- 本地MKL版本不支持HGEMM
+    if is_plat("linux") then
+        -- Common header layout: /usr/include/mkl/mkl.h
+        if os.isdir("/usr/include/mkl") then
+            add_includedirs("/usr/include/mkl", {public = true, system = true})
+        end
+
+        -- oneAPI default include path
+        local oneapi_mkl_include = "/opt/intel/oneapi/mkl/latest/include"
+        if os.isdir(oneapi_mkl_include) then
+            add_includedirs(oneapi_mkl_include, {public = true, system = true})
+        end
+
+        -- oneAPI default runtime library path
+        local oneapi_mkl_libdir = "/opt/intel/oneapi/mkl/latest/lib/intel64"
+        if os.isdir(oneapi_mkl_libdir) then
+            add_linkdirs(oneapi_mkl_libdir)
+            add_rpathdirs(oneapi_mkl_libdir)
+        end
+
+        add_links("mkl_rt")
     end
 end
 

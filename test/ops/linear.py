@@ -49,6 +49,7 @@ def test_op_linear(
             lambda: torch_linear(out, x, w, bias),
             lambda: llaisys.Ops.linear(out_, x_, w_, bias_),
             device_name,
+            repeat=10,
         )
 
 
@@ -63,7 +64,8 @@ if __name__ == "__main__":
         # ((2, 3), (2, 4), (3, 4), True),
         # ((2, 3), (2, 4), (3, 4), False),
         # ((128, 1024), (128, 1024), (1024, 1024), True),
-        ((128, 4096), (128, 4096), (4096, 4096), True),
+        ((128, 2048), (128, 2048), (2048, 2048), True),
+        # ((128, 4096), (128, 4096), (4096, 4096), True),
         # ((512, 4096), (512, 4096), (4096, 4096), True),
     ]
     testDtypePrec = [

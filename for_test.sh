@@ -1,7 +1,10 @@
 set -e
-xmake f -c --openmp=y --cpu-blas=y
+xmake f -c --openmp=y --cpu-blas=y --cpu-mkl=y --cpu-onednn=y
 xmake
 xmake install
+export LLAISYS_LINEAR_LOG_BACKEND=1
+# export LLAISYS_LINEAR_FORCE_BACKEND=onednn
+
 # pip install -e ./python/
 # pip install ./python/
 
