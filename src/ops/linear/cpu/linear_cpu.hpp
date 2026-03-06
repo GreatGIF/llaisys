@@ -10,6 +10,7 @@ namespace llaisys::ops::cpu {
 enum class LinearCPUStrategy : uint8_t {
 	NAIVE_SMALL = 0,
 	OMP_PARALLEL = 1,
+	OMP_TILED = 2,
 };
 
 LinearCPUStrategy choose_linear_strategy(size_t M, size_t N, size_t K);
