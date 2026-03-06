@@ -1,5 +1,5 @@
 set -e
-xmake f -c --openmp=true
+xmake f -c --openmp=y --cpu-blas=y
 xmake
 xmake install
 # pip install -e ./python/

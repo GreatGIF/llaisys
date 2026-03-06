@@ -19,6 +19,12 @@ option("openmp")
     set_description("Enable OpenMP parallelization for CPU operators")
 option_end()
 
+option("cpu-blas")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Enable BLAS backend (OpenBLAS) for CPU linear operator")
+option_end()
+
 if has_config("nv-gpu") then
     add_defines("ENABLE_NVIDIA_API")
     includes("xmake/nvidia.lua")
@@ -42,6 +48,13 @@ if has_config("openmp") then
             add_ldflags("-fopenmp")
             add_shflags("-fopenmp")
         end
+    end
+end
+
+if has_config("cpu-blas") then
+    add_defines("LLAISYS_ENABLE_CPU_BLAS")
+    if is_plat("linux") then
+        add_links("openblas")
     end
 end
 

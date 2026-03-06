@@ -3,10 +3,22 @@
 #include "../../../utils.hpp"
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
+
+#if defined(LLAISYS_ENABLE_CPU_BLAS)
+#if __has_include(<cblas.h>)
+#include <cblas.h>
+#define LLAISYS_HAS_CBLAS 1
+#else
+#define LLAISYS_HAS_CBLAS 0
+#endif
+#else
+#define LLAISYS_HAS_CBLAS 0
+#endif
 
 namespace llaisys::ops::cpu {
 
-// namespace {
+namespace {
 
 // size_t read_block_size_from_env(const char *name, size_t default_value) {
 // 	const char *value = std::getenv(name);
@@ -35,18 +47,49 @@ namespace llaisys::ops::cpu {
 // 	return {BM, BN, BK};
 // }
 
-// } // namespace
+// template <typename T>
+// inline float load_as_f32(const T *ptr, size_t idx) {
+// 	if constexpr (std::is_same_v<T, llaisys::bf16_t> || std::is_same_v<T, llaisys::fp16_t>) {
+// 		return llaisys::utils::cast<float>(ptr[idx]);
+// 	} else {
+// 		return static_cast<float>(ptr[idx]);
+// 	}
+// }
 
-LinearCPUStrategy choose_linear_strategy(size_t M, size_t N, size_t K) {
+// template <typename T>
+// inline T cast_from_f32(float v) {
+// 	if constexpr (std::is_same_v<T, llaisys::bf16_t> || std::is_same_v<T, llaisys::fp16_t>) {
+// 		return llaisys::utils::cast<T>(v);
+// 	} else {
+// 		return static_cast<T>(v);
+// 	}
+// }
+
+inline bool can_use_blas_for_type(llaisysDataType_t type) {
+	return LLAISYS_HAS_CBLAS && type == LLAISYS_DTYPE_F32;
+}
+
+} // namespace
+
+LinearCPUStrategy choose_linear_strategy(size_t M, size_t N, size_t K, bool can_use_blas) {
 #ifdef ENABLE_OPENMP
 	constexpr size_t kMediumWorkload = 64 * 1024;
 	constexpr size_t kLargeWorkload = 4 * 1024 * 1024;
 	const size_t workload = M * N * K;
+	if (can_use_blas && workload >= kLargeWorkload) {
+		return LinearCPUStrategy::BLAS_GEMM;
+	}
 	if (workload >= kLargeWorkload) {
 		return LinearCPUStrategy::OMP_TILED;
 	}
 	if (workload >= kMediumWorkload) {
 		return LinearCPUStrategy::OMP_PARALLEL;
+	}
+#else
+	const size_t workload = M * N * K;
+	constexpr size_t kLargeWorkload = 4 * 1024 * 1024;
+	if (can_use_blas && workload >= kLargeWorkload) {
+		return LinearCPUStrategy::BLAS_GEMM;
 	}
 #endif
 	return LinearCPUStrategy::NAIVE_SMALL;
@@ -121,9 +164,39 @@ void linear_kernel_tiled(T *out, const T *in, const T *weight, const T *bias, si
 	}
 }
 
+void linear_kernel_blas_f32(float *out, const float *in, const float *weight, const float *bias, size_t M, size_t N, size_t K) {
+#if LLAISYS_HAS_CBLAS
+	float beta = 0.0f;
+	if (bias != nullptr) {
+#ifdef ENABLE_OPENMP
+		#pragma omp parallel for schedule(static) if (M * N >= 4096)
+#endif
+		for (size_t m = 0; m < M; ++m) {
+			float *row = out + m * N;
+			for (size_t n = 0; n < N; ++n) {
+				row[n] = bias[n];
+			}
+		}
+		beta = 1.0f;
+	}
+
+	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), 
+				1.0f, in, static_cast<int>(K), weight, static_cast<int>(K), beta, out, static_cast<int>(N));
+#else
+	linear_kernel_tiled<float>(out, in, weight, bias, M, N, K);
+#endif
+}
+
 template <typename T>
-void linear_dispatch_by_strategy(T *out, const T *in, const T *weight, const T *bias, size_t M, size_t N, size_t K, LinearCPUStrategy strategy) {
+void linear_dispatch_by_strategy(T *out, const T *in, const T *weight, const T *bias, size_t M, size_t N, size_t K, 
+								 LinearCPUStrategy strategy) {
 	switch (strategy) {
+	case LinearCPUStrategy::BLAS_GEMM:
+		if constexpr (std::is_same_v<T, float>) {
+			linear_kernel_blas_f32(out, in, weight, bias, M, N, K);
+			break;
+		}
+		[[fallthrough]];
 	case LinearCPUStrategy::OMP_TILED:
 		linear_kernel_tiled<T>(out, in, weight, bias, M, N, K);
 		break;
@@ -138,7 +211,11 @@ void linear_dispatch_by_strategy(T *out, const T *in, const T *weight, const T *
 }
 
 void linear(std::byte *out, const std::byte *in, const std::byte *weight, const std::byte *bias, llaisysDataType_t type, size_t M, size_t N, size_t K) {
-	const auto strategy = choose_linear_strategy(M, N, K);
+	const bool can_use_blas = can_use_blas_for_type(type) &&
+					 M <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
+					 N <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
+					 K <= static_cast<size_t>(std::numeric_limits<int>::max());
+	const auto strategy = choose_linear_strategy(M, N, K, can_use_blas);
 
 	switch (type) {
 	case LLAISYS_DTYPE_F32:
