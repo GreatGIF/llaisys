@@ -1,5 +1,5 @@
 set -e
-xmake f -c --openmp=y --cpu-blas=y --cpu-mkl=y --cpu-onednn=y
+xmake f -cv --openmp=y --cpu-blas=y --cpu-mkl=y --cpu-onednn=y --nv-gpu=y
 xmake
 xmake install
 export LLAISYS_LINEAR_LOG_BACKEND=1

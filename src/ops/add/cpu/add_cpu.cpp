@@ -2,8 +2,6 @@
 
 #include "../../../utils.hpp"
 
-#include <cmath>
-
 template <typename T>
 void add_(T *c, const T *a, const T *b, size_t numel) {
 #ifdef ENABLE_OPENMP
