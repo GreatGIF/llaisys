@@ -122,6 +122,9 @@ target("llaisys-device")
     set_kind("static")
     add_deps("llaisys-utils")
     add_deps("llaisys-device-cpu")
+    if has_config("nv-gpu") then
+        add_deps("llaisys-device-nvidia")
+    end
 
     set_languages("cxx17")
     set_warnings("all", "error")
@@ -168,6 +171,9 @@ target_end()
 target("llaisys-ops")
     set_kind("static")
     add_deps("llaisys-ops-cpu")
+    if has_config("nv-gpu") then
+        add_deps("llaisys-ops-nvidia")
+    end
 
     set_languages("cxx17")
     set_warnings("all", "error")
@@ -198,6 +204,9 @@ target_end()
 
 target("llaisys")
     set_kind("shared")
+    if is_plat("linux") then
+        add_rpathdirs("$ORIGIN")    -- 其他动态库会保留到python/llaisys/libllaisys中, 通过rpath添加当前需要加载的动态库搜索路径
+    end
     add_deps("llaisys-utils")
     add_deps("llaisys-device")
     add_deps("llaisys-core")

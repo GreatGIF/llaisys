@@ -5,7 +5,7 @@ using namespace llaisys::models;
 
 __C {
     struct LlaisysQwen2Model {
-        Qwen2Model *model;
+        Qwen2Model *impl;
     };
 
     struct LlaisysQwen2Model *llaisysQwen2ModelCreate(const LlaisysQwen2Meta *meta, llaisysDeviceType_t device, int *device_ids, int ndevice) {
@@ -13,15 +13,15 @@ __C {
     }
 
     void llaisysQwen2ModelDestroy(struct LlaisysQwen2Model *model) {
-        delete model->model;
+        delete model->impl;
         delete model;
     }
 
     struct LlaisysQwen2Weights *llaisysQwen2ModelWeights(struct LlaisysQwen2Model *model) {
-        return &model->model->weights();
+        return &model->impl->weights();
     }
 
     int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t *token_ids, size_t ntoken) {
-        return model->model->infer(token_ids, ntoken);
+        return model->impl->infer(token_ids, ntoken);
     }
 }
