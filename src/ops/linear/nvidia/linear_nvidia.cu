@@ -2,11 +2,10 @@
 
 #include "../../../core/llaisys_core.hpp"
 #include "../../../utils.hpp"
+#include "../../../utils/nvidia_cast.cuh"
 #include "../../../utils/nvidia_check.cuh"
 
 #include <cublas_v2.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
@@ -15,43 +14,13 @@
 namespace {
 
 template <typename T>
-__device__ __forceinline__ float to_float(T v) {
-	return static_cast<float>(v);
-}
-
-template <>
-__device__ __forceinline__ float to_float<half>(half v) {
-	return __half2float(v);
-}
-
-template <>
-__device__ __forceinline__ float to_float<nv_bfloat16>(nv_bfloat16 v) {
-	return __bfloat162float(v);
-}
-
-template <typename T>
-__device__ __forceinline__ T from_float(float v) {
-	return static_cast<T>(v);
-}
-
-template <>
-__device__ __forceinline__ half from_float<half>(float v) {
-	return __float2half_rn(v);
-}
-
-template <>
-__device__ __forceinline__ nv_bfloat16 from_float<nv_bfloat16>(float v) {
-	return __float2bfloat16(v);
-}
-
-template <typename T>
 __global__ void add_bias_kernel(T *out, const T *bias, size_t M, size_t N) {
 	size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
 	size_t total = M * N;
 	if (idx < total) {
 		size_t n = idx % N;
-		float v = to_float(out[idx]) + to_float(bias[n]);
-		out[idx] = from_float<T>(v);
+		float v = llaisys::utils::nvidia::to_float(out[idx]) + llaisys::utils::nvidia::to_float(bias[n]);
+		out[idx] = llaisys::utils::nvidia::from_float<T>(v);
 	}
 }
 

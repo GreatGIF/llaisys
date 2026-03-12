@@ -1,27 +1,11 @@
 #include "argmax_nvidia.cuh"
 
 #include "../../../utils.hpp"
+#include "../../../utils/nvidia_cast.cuh"
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <cfloat>
-
-template <typename T>
-__device__ __forceinline__ float to_float(T v) {
-    return static_cast<float>(v);
-}
-
-template <>
-__device__ __forceinline__ float to_float<half>(half v) {
-    return __half2float(v);
-}
-
-template <>
-__device__ __forceinline__ float to_float<nv_bfloat16>(nv_bfloat16 v) {
-    return __bfloat162float(v);
-}
 
 template <typename T>
 __global__ void argmax_kernel(std::int64_t *max_idx, T *max_val, const T *vals, size_t size) {
@@ -38,7 +22,7 @@ __global__ void argmax_kernel(std::int64_t *max_idx, T *max_val, const T *vals, 
 
     for (size_t i = static_cast<size_t>(tid); i < size; i += blockDim.x) {
         const T v_raw = vals[i];
-        const float v = to_float(v_raw);
+        const float v = llaisys::utils::nvidia::to_float(v_raw);
         if (v > local_best_score || (v == local_best_score && static_cast<std::int64_t>(i) < local_best_idx)) {
             local_best_score = v;
             local_best_idx = static_cast<std::int64_t>(i);
