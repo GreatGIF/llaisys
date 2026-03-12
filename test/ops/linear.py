@@ -32,7 +32,7 @@ def test_op_linear(
         bias, bias_ = random_tensor((w_shape[0],), dtype_name, device_name)
 
     out, out_ = random_tensor(out_shape, dtype_name, device_name)
-    out2, _ = random_tensor(out_shape, dtype_name, device_name)
+    # out2, _ = random_tensor(out_shape, dtype_name, device_name)
     torch_linear(out, x, w, bias)
     # torch_linear(out2, x, w, torch.zeros(bias.shape))
     # print("x:", x)
@@ -61,12 +61,12 @@ if __name__ == "__main__":
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
     testShapes = [
-        # ((2, 3), (2, 4), (3, 4), True),
-        # ((2, 3), (2, 4), (3, 4), False),
-        # ((128, 1024), (128, 1024), (1024, 1024), True),
-        ((128, 2048), (128, 2048), (2048, 2048), True),
+        ((2, 3), (2, 4), (3, 4), True),
+        ((2, 3), (2, 4), (3, 4), False),
+        ((128, 1024), (128, 1024), (1024, 1024), True),
+        # ((128, 2048), (128, 2048), (2048, 2048), True),
         # ((128, 4096), (128, 4096), (4096, 4096), True),
-        # ((512, 4096), (512, 4096), (4096, 4096), True),
+        ((512, 4096), (512, 4096), (4096, 4096), True),
     ]
     testDtypePrec = [
         # type, atol, rtol
