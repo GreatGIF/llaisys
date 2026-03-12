@@ -8,7 +8,7 @@
 template <typename T>
 void rope_(T *out, const T *in, size_t seq_len, size_t head_num, size_t head_dim,
            const std::int64_t *pos_ids, float theta) {
-    size_t half_head_dim = head_dim / 2;
+    size_t half_head_dim = head_dim >> 1;
     std::vector<float> freqs_sin(seq_len * half_head_dim, 0);
     std::vector<float> freqs_cos(seq_len * half_head_dim, 0);
 #ifdef ENABLE_OPENMP
