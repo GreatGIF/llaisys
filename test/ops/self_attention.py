@@ -15,7 +15,7 @@ def torch_self_attention(attn_val, query, key, value, scale):
     L, S = query.size(-2), key.size(-2)
     attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
 
-    temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=S-L)
+    temp_mask = torch.ones(L, S, dtype=torch.bool, device=query.device).tril(diagonal=S-L)
     attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
     attn_bias.to(query.dtype)
 
@@ -24,7 +24,7 @@ def torch_self_attention(attn_val, query, key, value, scale):
 
     attn_weight = query @ key.transpose(-2, -1) * scale
     attn_weight += attn_bias
-    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.softmax(attn_weight, dim=-1, dtype=query.dtype)
     attn_val.copy_((attn_weight @ value).transpose(-2, -3))
 
 
@@ -72,7 +72,8 @@ if __name__ == "__main__":
         # qlen, kvlen, nh, nkvh, hd
         (2, 2, 1, 1, 4),
         (5, 11, 4, 2, 8),
-        (128, 128, 64, 8, 128)
+        (128, 128, 64, 8, 128),
+        (128, 2048, 32, 32, 256),
     ]
     testDtypePrec = [
         # type, atol, rtol
