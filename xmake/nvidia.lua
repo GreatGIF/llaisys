@@ -31,6 +31,7 @@ target("llaisys-ops-nvidia")
     add_deps("llaisys-tensor")
     set_languages("cxx17")
     set_warnings("all", "error")
+    add_links("cublas")
 
     add_files("../src/ops/*/nvidia/*.cu")
     add_cugencodes("native")
