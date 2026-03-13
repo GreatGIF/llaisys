@@ -1,5 +1,5 @@
 from .tensor import llaisysTensor_t
-from ctypes import c_float
+from ctypes import c_float, c_int32, c_uint64
 
 def load_ops(lib):
     lib.llaisysAdd.argtypes = [llaisysTensor_t, llaisysTensor_t, llaisysTensor_t]
@@ -34,3 +34,13 @@ def load_ops(lib):
 
     lib.llaisysSwiGLU.argtypes = [llaisysTensor_t, llaisysTensor_t, llaisysTensor_t]
     lib.llaisysSwiGLU.restype = None
+
+    lib.llaisysSampling.argtypes = [
+        llaisysTensor_t,
+        llaisysTensor_t,
+        c_float,
+        c_int32,
+        c_float,
+        c_uint64,
+    ]
+    lib.llaisysSampling.restype = None

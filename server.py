@@ -59,6 +59,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = Field(default=0.8, ge=0.0, le=2.0)
     top_p: float = Field(default=0.8, ge=0.0, le=1.0)
     top_k: int = Field(default=50, ge=0)
+    seed: int = Field(default=0, ge=0, description="Sampling seed (0 = non-deterministic)")
     max_tokens: int = Field(default=128, ge=1, le=4096)
     stream: bool = Field(default=False, description="Whether to stream the response")
 
@@ -111,6 +112,7 @@ class ModelManager:
         temperature: float = 0.8,
         top_p: float = 0.8,
         top_k: int = 50,
+        seed: int = 0,
     ):
         self.device = device
         self.model_path = model_path
@@ -118,6 +120,7 @@ class ModelManager:
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
+        self.seed = seed
         self.tokenizer = None
         self.model = None
         self.device_map = self._get_device_map()
@@ -175,6 +178,7 @@ class ModelManager:
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
+        seed: Optional[int] = None,
         stream: bool = False,
     ):
         """Generate text completion.
@@ -185,6 +189,7 @@ class ModelManager:
             temperature: Sampling temperature (uses default if None)
             top_p: Top-p sampling parameter (uses default if None)
             top_k: Top-k sampling parameter (uses default if None)
+            seed: Sampling seed (uses default if None; 0 = non-deterministic)
             stream: Whether to stream tokens as they are generated
 
         Yields/Returns:
@@ -198,20 +203,24 @@ class ModelManager:
         temperature = temperature if temperature is not None else self.temperature
         top_p = top_p if top_p is not None else self.top_p
         top_k = top_k if top_k is not None else self.top_k
+        seed = seed if seed != 0 else self.seed
 
         if self.backend == "pytorch":
             return self._generate_pytorch(
-                prompt, max_new_tokens, temperature, top_p, top_k, stream
+                prompt, max_new_tokens, temperature, top_p, top_k, seed, stream
             )
         elif self.backend == "llaisys":
             return self._generate_llaisys(
-                prompt, max_new_tokens, temperature, top_p, top_k, stream
+                prompt, max_new_tokens, temperature, top_p, top_k, seed, stream
             )
         else:
             raise ValueError(f"Unknown backend: {self.backend}")
 
-    def _generate_non_streaming(self, inputs, max_new_tokens, temperature, top_p, top_k):
+    def _generate_non_streaming(self, inputs, max_new_tokens, temperature, top_p, top_k, seed):
         """Generate all tokens at once."""
+        if seed > 0:
+            torch.manual_seed(seed)
+
         with torch.no_grad():
             outputs = self.model.generate(
                 inputs,
@@ -225,10 +234,13 @@ class ModelManager:
         full_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
         return full_text
 
-    def _generate_streaming(self, inputs, max_new_tokens, temperature, top_p, top_k):
+    def _generate_streaming(self, inputs, max_new_tokens, temperature, top_p, top_k, seed):
         """Generate tokens one by one (streaming)."""
         from transformers import TextIteratorStreamer
         from threading import Thread
+
+        if seed > 0:
+            torch.manual_seed(seed)
 
         streamer = TextIteratorStreamer(
             self.tokenizer, skip_special_tokens=True, skip_prompt=True
@@ -253,7 +265,7 @@ class ModelManager:
             yield text
 
     def _generate_pytorch(
-        self, prompt: str, max_new_tokens: int, temperature: float, top_p: float, top_k: int, stream: bool
+        self, prompt: str, max_new_tokens: int, temperature: float, top_p: float, top_k: int, seed: int, stream: bool
     ):
         """Generate using PyTorch backend."""
         # Tokenize
@@ -261,15 +273,15 @@ class ModelManager:
 
         if stream:
             return self._generate_streaming(
-                inputs, max_new_tokens, temperature, top_p, top_k
+                inputs, max_new_tokens, temperature, top_p, top_k, seed
             )
         else:
             return self._generate_non_streaming(
-                inputs, max_new_tokens, temperature, top_p, top_k
+                inputs, max_new_tokens, temperature, top_p, top_k, seed
             )
 
     def _generate_llaisys(
-        self, prompt: str, max_new_tokens: int, temperature: float, top_p: float, top_k: int, stream: bool
+        self, prompt: str, max_new_tokens: int, temperature: float, top_p: float, top_k: int, seed: int, stream: bool
     ):
         """Generate using LLAISYS backend."""
         # Encode prompt
@@ -282,15 +294,19 @@ class ModelManager:
             top_k=top_k,
             top_p=top_p,
             temperature=temperature,
+            seed=seed,
         )
 
         full_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
 
         if stream:
             # Convert to streaming by splitting into tokens
-            for token_id in output_ids[len(input_ids):]:
-                token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
-                yield token_text
+            def _token_generator():
+                for token_id in output_ids[len(input_ids):]:
+                    token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
+                    yield token_text
+
+            return _token_generator()
         else:
             return full_text
 
@@ -324,10 +340,11 @@ async def startup_event():
     temperature = float(os.environ.get("TEMPERATURE", "0.8"))
     top_p = float(os.environ.get("TOP_P", "0.8"))
     top_k = int(os.environ.get("TOP_K", "50"))
+    seed = int(os.environ.get("SEED", "0"))
 
     print(f"Initializing model manager")
     print(f"  device={device}, backend={backend}")
-    print(f"  temperature={temperature}, top_p={top_p}, top_k={top_k}")
+    print(f"  temperature={temperature}, top_p={top_p}, top_k={top_k}, seed={seed}")
 
     model_manager = ModelManager(
         device=device,
@@ -336,6 +353,7 @@ async def startup_event():
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
+        seed=seed,
     )
     model_manager.load_model(model_id=model_id)
 
@@ -388,6 +406,7 @@ def _non_streaming_chat_completion(
         temperature=request.temperature,
         top_p=request.top_p,
         top_k=request.top_k,
+        seed=request.seed,
         stream=False,
     )
 
@@ -428,6 +447,7 @@ async def _stream_chat_completion(
         temperature=request.temperature,
         top_p=request.top_p,
         top_k=request.top_k,
+        seed=request.seed,
         stream=True,
     ):
         # Create streaming response chunk
@@ -544,6 +564,12 @@ if __name__ == "__main__":
         help="Top-k sampling parameter (default: 50)",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Sampling seed (default: 0, non-deterministic)",
+    )
+    parser.add_argument(
         "--host",
         type=str,
         default="0.0.0.0",
@@ -570,6 +596,7 @@ if __name__ == "__main__":
     os.environ["TEMPERATURE"] = str(args.temperature)
     os.environ["TOP_P"] = str(args.top_p)
     os.environ["TOP_K"] = str(args.top_k)
+    os.environ["SEED"] = str(args.seed)
     if args.model:
         os.environ["MODEL_PATH"] = args.model
 
@@ -578,5 +605,5 @@ if __name__ == "__main__":
         print(f"Model: {args.model}")
     print(f"Backend: {args.backend}")
     print(f"Device: {args.device}")
-    print(f"Sampling: temperature={args.temperature}, top_p={args.top_p}, top_k={args.top_k}")
+    print(f"Sampling: temperature={args.temperature}, top_p={args.top_p}, top_k={args.top_k}, seed={args.seed}")
     uvicorn.run(app, host=args.host, port=args.port, workers=args.workers)

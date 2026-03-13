@@ -4,6 +4,14 @@
 #include "../tensor.h"
 
 __C {
+    // Sampling parameters for token generation
+    struct LlaisysQwen2SamplingParams {
+        float temperature;  // Temperature for softmax (>0, lower = more deterministic)
+        int32_t top_k;      // Keep only top K tokens (0 = disable)
+        float top_p;        // Nucleus sampling threshold (0-1, 0 = disable)
+        uint64_t seed;      // Random seed for reproducibility (0 = non-deterministic)
+    };
+
     struct LlaisysQwen2Meta {
         llaisysDataType_t dtype;
         size_t nlayer, hs, nh, nkvh, dh, di, maxseq, voc;
@@ -37,6 +45,9 @@ __C {
 
     __export struct LlaisysQwen2Weights *llaisysQwen2ModelWeights(struct LlaisysQwen2Model * model);
 
-    __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken);
+    __export void llaisysQwen2ModelReset(struct LlaisysQwen2Model * model);
+
+    __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t *token_ids, size_t ntoken,
+                                            const struct LlaisysQwen2SamplingParams *sampling_params);
 }
 #endif // LLAISYS_MODELS_QWEN2_H

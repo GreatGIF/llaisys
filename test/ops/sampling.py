@@ -377,6 +377,51 @@ def test_topp_sampling(
     print(f"   ✓ Top-P sampling passed (all {num_samples} samples valid)")
 
 
+def test_temperature_zero_topk1_equals_argmax(
+    batch_size=8,
+    vocab_size=256,
+    device_name="cpu",
+):
+    """Verify sampling == argmax when temperature=0 and top_k=1."""
+    print(f"   batch_size={batch_size}, vocab_size={vocab_size}, temperature=0, top_k=1")
+
+    logits_torch, logits_llaisys = random_tensor(
+        (batch_size, vocab_size), "f32", device_name
+    )
+
+    # Add a tiny deterministic offset to reduce tie probability.
+    offset = torch.arange(vocab_size, dtype=torch.float32, device=torch_device(device_name)) * 1e-7
+    logits_torch = logits_torch + offset.unsqueeze(0)
+
+    api = llaisys.RuntimeAPI(llaisys_device(device_name))
+    api.memcpy_sync(
+        logits_llaisys.data_ptr(),
+        logits_torch.data_ptr(),
+        batch_size * vocab_size * 4,
+        llaisys.MemcpyKind.D2D,
+    )
+
+    out_llaisys = llaisys.Tensor(
+        (batch_size,),
+        dtype=llaisys.DataType.I64,
+        device=llaisys_device(device_name),
+    )
+
+    llaisys.Ops.sampling(out_llaisys, logits_llaisys, temperature=0.0, top_k=1, seed=42)
+
+    result = torch.zeros((batch_size,), dtype=torch.int64, device=torch_device(device_name))
+    api.memcpy_sync(
+        result.data_ptr(), out_llaisys.data_ptr(), batch_size * 8,
+        llaisys.MemcpyKind.D2D,
+    )
+
+    expected = torch.argmax(logits_torch, dim=-1)
+    assert torch.equal(result, expected), \
+        f"temperature=0, top_k=1 should equal argmax: got {result.tolist()}, expected {expected.tolist()}"
+
+    print("   ✓ temperature=0 & top_k=1 equals argmax")
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -406,6 +451,9 @@ if __name__ == "__main__":
         
         print("\n[Test 6] Top-P Sampling")
         test_topp_sampling(batch_size=1, vocab_size=100, top_p=0.95, num_samples=20, device_name=args.device)
+
+        print("\n[Test 7] temperature=0 & top_k=1 == argmax")
+        test_temperature_zero_topk1_equals_argmax(batch_size=8, vocab_size=256, device_name=args.device)
         
         print("\n" + "=" * 70)
         print("✓ All enhanced tests passed!")

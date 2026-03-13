@@ -15,6 +15,7 @@ def chat_non_streaming(
     temperature: float = 0.8,
     top_p: float = 0.8,
     top_k: int = 50,
+    seed: int = 0,
     max_tokens: int = 256,
 ):
     """Send a non-streaming chat completion request."""
@@ -34,6 +35,7 @@ def chat_non_streaming(
         "temperature": temperature,
         "top_p": top_p,
         "top_k": top_k,
+        "seed": seed,
         "max_tokens": max_tokens,
         "stream": False,
     }
@@ -69,6 +71,7 @@ def chat_streaming(
     temperature: float = 0.8,
     top_p: float = 0.8,
     top_k: int = 50,
+    seed: int = 0,
     max_tokens: int = 256,
 ):
     """Send a streaming chat completion request."""
@@ -89,6 +92,7 @@ def chat_streaming(
         "temperature": temperature,
         "top_p": top_p,
         "top_k": top_k,
+        "seed": seed,
         "max_tokens": max_tokens,
         "stream": True,
     }
@@ -203,12 +207,17 @@ if __name__ == "__main__":
         help="Maximum tokens to generate",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Sampling seed (default: 0, non-deterministic)",
+    )
+    parser.add_argument(
         "--mode",
         choices=["health", "models", "stream", "non-stream", "all"],
         default="non-stream",
         help="Operating mode",
     )
-
     args = parser.parse_args()
 
     if args.mode in ["health", "all"]:
@@ -224,6 +233,7 @@ if __name__ == "__main__":
             temperature=args.temperature,
             top_p=args.top_p,
             top_k=args.top_k,
+            seed=args.seed,
             max_tokens=args.max_tokens,
         )
 
@@ -234,5 +244,6 @@ if __name__ == "__main__":
             temperature=args.temperature,
             top_p=args.top_p,
             top_k=args.top_k,
+            seed=args.seed,
             max_tokens=args.max_tokens,
         )

@@ -11,7 +11,7 @@ namespace llaisys::ops {
 
 void sampling(tensor_t out, tensor_t logits, float temperature, int32_t top_k, 
               float top_p, uint64_t seed) {
-    
+
     // Validate inputs
     // CHECK_SAME_DTYPE(out, logits);
     CHECK_SAME_DEVICE(out, logits);

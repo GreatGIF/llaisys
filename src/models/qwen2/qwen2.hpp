@@ -11,7 +11,8 @@ public:
     ~Qwen2Model();
 
     LlaisysQwen2Weights &weights() { return _weights_c; }
-    int64_t infer(int64_t *token_ids, size_t ntoken);
+    void reset();
+    int64_t infer(int64_t *token_ids, size_t ntoken, const LlaisysQwen2SamplingParams &params);
 
 private:
     LlaisysQwen2Meta _meta;

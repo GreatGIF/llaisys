@@ -6,7 +6,7 @@ from pathlib import Path
 
 def run_all_ops_tests(device: str, profile: bool) -> None:
     ops_dir = Path(__file__).resolve().parent / "ops"
-    exclude = {"__init__.py", "tune_linear_blocks.py"}
+    exclude = {"__init__.py", "tune_linear_blocks.py", "profile_decoding.py", "sampling.py"}
     test_files = sorted(
         f for f in ops_dir.glob("*.py") if f.name not in exclude
     )

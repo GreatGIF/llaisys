@@ -21,7 +21,14 @@ __C {
         return &model->impl->weights();
     }
 
-    int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t *token_ids, size_t ntoken) {
-        return model->impl->infer(token_ids, ntoken);
+    void llaisysQwen2ModelReset(struct LlaisysQwen2Model *model) {
+        model->impl->reset();
+    }
+
+    int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t *token_ids, size_t ntoken,
+                                      const struct LlaisysQwen2SamplingParams *sampling_params) {
+        // Create default sampling params if not provided
+        LlaisysQwen2SamplingParams params = sampling_params ? *sampling_params : LlaisysQwen2SamplingParams{1.0f, 0, 0.0f, 0};
+        return model->impl->infer(token_ids, ntoken, params);
     }
 }

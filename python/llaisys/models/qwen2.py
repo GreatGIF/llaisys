@@ -10,6 +10,7 @@ from ..tensor import Tensor
 
 from pathlib import Path
 import safetensors
+import secrets
 
 
 class Qwen2:
@@ -101,24 +102,47 @@ class Qwen2:
         self,
         inputs: Sequence[int],
         max_new_tokens: int = 120,
-        top_k: int = 1,             # not used
-        top_p: float = 0.8,         # not used
-        temperature: float = 0.8,   # not used
+        temperature: float = 1.0,
+        top_k: int = 0,                     # 0 to disable
+        top_p: float = 0.0,                 # 0 to disable
+        seed: int = 0,
     ):
+        # New request/session: clear backend decode cursor/KV-cache position.
+        LIB_LLAISYS.llaisysQwen2ModelReset(self._model)
+
         output_tokens = []
         curr_inputs = list(inputs)
         output_tokens.extend(curr_inputs)
-        # print(f"Input tokens: {curr_inputs}")
+        
+        
+        from ..libllaisys.models import LlaisysQwen2SamplingParams
+        # Seed policy:
+        # - seed == 0: non-deterministic per generation call (random base seed)
+        # - seed != 0: deterministic/reproducible across runs
+        base_seed = seed if seed != 0 else secrets.randbits(64)
+        sampling_params = LlaisysQwen2SamplingParams(
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            seed=base_seed
+        )
+        sampling_params_ptr = ctypes.byref(sampling_params)
         
         # 推理
-        for _ in range(max_new_tokens or 2048):
+        for step in range(max_new_tokens or 2048):
+            # Avoid resetting RNG state every token: advance seed by decoding step.
+            # This keeps one run stochastic while preserving reproducibility when
+            # user provides a fixed non-zero seed.
+            # sampling_params.seed = ctypes.c_uint64((base_seed + step) & 0xFFFFFFFFFFFFFFFF).value
+
             token_ids = (ctypes.c_int64 * len(curr_inputs))(*curr_inputs)
             
             # Infer next token
             next_token = LIB_LLAISYS.llaisysQwen2ModelInfer(
                 self._model,
                 token_ids,
-                ctypes.c_size_t(len(curr_inputs))
+                ctypes.c_size_t(len(curr_inputs)),
+                sampling_params_ptr
             )
             
             output_tokens.append(int(next_token))

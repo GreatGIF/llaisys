@@ -18,6 +18,14 @@ class LlaisysQwen2Meta(ctypes.Structure):
         ("end_token", ctypes.c_int64),
     ]
 
+class LlaisysQwen2SamplingParams(ctypes.Structure):
+    _fields_ = [
+        ("temperature", ctypes.c_float),
+        ("top_k", ctypes.c_int32),
+        ("top_p", ctypes.c_float),
+        ("seed", ctypes.c_uint64),
+    ]
+
 class LlaisysQwen2Weights(ctypes.Structure):
     _fields_ = [
         ("in_embed", llaisysTensor_t),
@@ -54,9 +62,13 @@ def load_models(lib):
     lib.llaisysQwen2ModelWeights.argtypes = [llaisysQwen2Model_p]
     lib.llaisysQwen2ModelWeights.restype = ctypes.POINTER(LlaisysQwen2Weights)
 
+    lib.llaisysQwen2ModelReset.argtypes = [llaisysQwen2Model_p]
+    lib.llaisysQwen2ModelReset.restype = None
+
     lib.llaisysQwen2ModelInfer.argtypes = [
         llaisysQwen2Model_p,
         ctypes.POINTER(ctypes.c_int64),
         ctypes.c_size_t,
+        ctypes.POINTER(LlaisysQwen2SamplingParams),
     ]
     lib.llaisysQwen2ModelInfer.restype = ctypes.c_int64

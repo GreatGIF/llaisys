@@ -7,6 +7,7 @@
 #include "../../ops/rope/op.hpp"
 #include "../../ops/self_attention/op.hpp"
 #include "../../ops/swiglu/op.hpp"
+#include "../../ops/sampling/op.hpp"
 #include "../../llaisys/llaisys_tensor.hpp"
 #include "../../device/runtime_api.hpp"
 #include <cmath>
@@ -134,7 +135,13 @@ Qwen2Model::~Qwen2Model() {
     }
 }
 
-int64_t Qwen2Model::infer(int64_t *token_ids, size_t ntoken) {
+void Qwen2Model::reset() {
+    // Reset decode cursor for a new request/session.
+    // KV cache tensors are reused and overwritten from position 0 onward.
+    _cur_pos = 0;
+}
+
+int64_t Qwen2Model::infer(int64_t *token_ids, size_t ntoken, const LlaisysQwen2SamplingParams &params) {
 
     // _in_embed->slice(0, 1, 10)->debug();
     // _out_embed->slice(0, 1, 10)->debug();
@@ -280,7 +287,17 @@ int64_t Qwen2Model::infer(int64_t *token_ids, size_t ntoken) {
     auto next_token_idx = Tensor::create({1}, LLAISYS_DTYPE_I64, _device_type, _device_id);
     auto max_val = Tensor::create({1}, _meta.dtype, _device_type, _device_id);
 
-    ops::argmax(next_token_idx, max_val, logits->view({_meta.voc}));
+    // if (decoding_type == LLAISYS_QWEN2_SAMPLING) {
+    //     // Use sampling for decoding
+    //     ops::sampling(next_token_idx, logits->view({1, _meta.voc}), 
+    //                  params.temperature, params.top_k, params.top_p, params.seed);
+    // } else {
+    //     // Default: use argmax
+    //     auto max_val = Tensor::create({1}, _meta.dtype, _device_type, _device_id);
+    //     ops::argmax(next_token_idx, max_val, logits->view({_meta.voc}));
+    // }
+    ops::sampling(next_token_idx, logits->view({1, _meta.voc}), 
+                  params.temperature, params.top_k, params.top_p, params.seed);
 
     // Transfer result from device to CPU for return
     auto next_token_idx_cpu = next_token_idx->to(LLAISYS_DEVICE_CPU, 0);
