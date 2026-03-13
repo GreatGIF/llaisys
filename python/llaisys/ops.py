@@ -1,6 +1,6 @@
 from .libllaisys import LIB_LLAISYS
 from .tensor import Tensor
-from ctypes import c_float, c_int
+from ctypes import c_float, c_int, c_int32, c_uint64
 from typing import Optional
 
 
@@ -55,3 +55,15 @@ class Ops:
     @staticmethod
     def swiglu(out: Tensor, gate: Tensor, up: Tensor):
         LIB_LLAISYS.llaisysSwiGLU(out.lib_tensor(), gate.lib_tensor(), up.lib_tensor())
+
+    @staticmethod
+    def sampling(out: Tensor, logits: Tensor, temperature: float = 1.0, 
+                 top_k: int = 0, top_p: float = 0.0, seed: int = 0):
+        LIB_LLAISYS.llaisysSampling(
+            out.lib_tensor(), 
+            logits.lib_tensor(), 
+            c_float(temperature),
+            c_int32(top_k),
+            c_float(top_p),
+            c_uint64(seed)
+        )
