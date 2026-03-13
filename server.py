@@ -1,0 +1,582 @@
+"""
+HTTP Server for LLM inference with OpenAI Chat Completion API compatibility.
+Supports both streaming and non-streaming modes.
+"""
+
+import os
+import sys
+import io
+import time
+import uuid
+import json
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+from enum import Enum
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from huggingface_hub import snapshot_download
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def get_llaisys_device(device_name: str):
+    """Convert device name string to llaisys device type."""
+    try:
+        import llaisys
+        if device_name == "cpu":
+            return llaisys.DeviceType.CPU
+        elif device_name == "nvidia":
+            return llaisys.DeviceType.NVIDIA
+        else:
+            raise ValueError(f"Unsupported device name: {device_name}")
+    except ImportError:
+        raise ImportError("llaisys not installed")
+
+
+# ============================================================================
+# Data Models (OpenAI-compatible)
+# ============================================================================
+
+class ChatMessage(BaseModel):
+    """Message in a chat conversation."""
+    role: str = Field(..., description="Role: 'user', 'assistant', or 'system'")
+    content: str = Field(..., description="Message content")
+
+
+class ChatCompletionRequest(BaseModel):
+    """Chat completion request following OpenAI API format."""
+    model: str = Field(default="qwen-1.5b", description="Model name")
+    messages: List[ChatMessage] = Field(..., description="List of messages")
+    temperature: float = Field(default=0.8, ge=0.0, le=2.0)
+    top_p: float = Field(default=0.8, ge=0.0, le=1.0)
+    top_k: int = Field(default=50, ge=0)
+    max_tokens: int = Field(default=128, ge=1, le=4096)
+    stream: bool = Field(default=False, description="Whether to stream the response")
+
+
+class ChatCompletionChoice(BaseModel):
+    """Choice in a chat completion response."""
+    index: int
+    message: ChatMessage
+    finish_reason: str = Field(default="stop")
+
+
+class ChatCompletionResponse(BaseModel):
+    """Non-streaming chat completion response (OpenAI compatible)."""
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str
+    choices: List[ChatCompletionChoice]
+    usage: Dict[str, int] = Field(default_factory=dict)
+
+
+class ChatCompletionStreamChoice(BaseModel):
+    """Choice in a streaming chat completion response."""
+    index: int
+    delta: Dict[str, Any]
+    finish_reason: Optional[str] = None
+
+
+class ChatCompletionStreamResponse(BaseModel):
+    """Streaming chat completion response chunk."""
+    id: str
+    object: str = "chat.completion.chunk"
+    created: int
+    model: str
+    choices: List[ChatCompletionStreamChoice]
+
+
+# ============================================================================
+# Model Management
+# ============================================================================
+
+class ModelManager:
+    """Manages model loading and inference."""
+
+    def __init__(
+        self,
+        device: str = "cpu",
+        model_path: Optional[str] = None,
+        backend: str = "pytorch",
+        temperature: float = 0.8,
+        top_p: float = 0.8,
+        top_k: int = 50,
+    ):
+        self.device = device
+        self.model_path = model_path
+        self.backend = backend
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+        self.tokenizer = None
+        self.model = None
+        self.device_map = self._get_device_map()
+
+    def _get_device_map(self) -> str | dict:
+        """Get appropriate device mapping for the model."""
+        if self.device == "cpu":
+            return "cpu"
+        elif self.device == "nvidia":
+            return "auto"  # auto device map for CUDA
+        return "cpu"
+
+    def load_model(self, model_id: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"):
+        """Load tokenizer and model."""
+        if self.tokenizer is not None and self.model is not None:
+            return  # Already loaded
+
+        print(f"Loading model: {model_id}")
+        print(f"Backend: {self.backend}")
+
+        if self.model_path and os.path.isdir(self.model_path):
+            print(f"Loading from local path: {self.model_path}")
+            model_path = self.model_path
+        else:
+            print(f"Downloading from Hugging Face Hub: {model_id}")
+            model_path = snapshot_download(model_id)
+
+        # Load tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=True
+        )
+
+        if self.backend == "pytorch":
+            # Load PyTorch model
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                dtype=torch.bfloat16,
+                device_map=self.device_map,
+                trust_remote_code=True,
+            )
+            print("PyTorch model loaded successfully")
+        elif self.backend == "llaisys":
+            # Load LLAISYS model
+            import llaisys
+            llaisys_device_type = get_llaisys_device(self.device)
+            self.model = llaisys.models.Qwen2(model_path, llaisys_device_type)
+            print("LLAISYS model loaded successfully")
+        else:
+            raise ValueError(f"Unknown backend: {self.backend}")
+
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 128,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        stream: bool = False,
+    ):
+        """Generate text completion.
+        
+        Args:
+            prompt: Input prompt text
+            max_new_tokens: Maximum number of tokens to generate
+            temperature: Sampling temperature (uses default if None)
+            top_p: Top-p sampling parameter (uses default if None)
+            top_k: Top-k sampling parameter (uses default if None)
+            stream: Whether to stream tokens as they are generated
+
+        Yields/Returns:
+            For streaming: generator of token strings
+            For non-streaming: full generated text
+        """
+        if self.tokenizer is None or self.model is None:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+
+        # Use provided values or fall back to defaults
+        temperature = temperature if temperature is not None else self.temperature
+        top_p = top_p if top_p is not None else self.top_p
+        top_k = top_k if top_k is not None else self.top_k
+
+        if self.backend == "pytorch":
+            return self._generate_pytorch(
+                prompt, max_new_tokens, temperature, top_p, top_k, stream
+            )
+        elif self.backend == "llaisys":
+            return self._generate_llaisys(
+                prompt, max_new_tokens, temperature, top_p, top_k, stream
+            )
+        else:
+            raise ValueError(f"Unknown backend: {self.backend}")
+
+    def _generate_non_streaming(self, inputs, max_new_tokens, temperature, top_p, top_k):
+        """Generate all tokens at once."""
+        with torch.no_grad():
+            outputs = self.model.generate(
+                inputs,
+                max_new_tokens=max_new_tokens,
+                top_k=top_k if top_k > 0 else None,
+                top_p=top_p,
+                temperature=temperature,
+                do_sample=temperature > 0.0,  # Enable sampling if temperature > 0
+            )
+
+        full_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        return full_text
+
+    def _generate_streaming(self, inputs, max_new_tokens, temperature, top_p, top_k):
+        """Generate tokens one by one (streaming)."""
+        from transformers import TextIteratorStreamer
+        from threading import Thread
+
+        streamer = TextIteratorStreamer(
+            self.tokenizer, skip_special_tokens=True, skip_prompt=True
+        )
+
+        generation_kwargs = {
+            "inputs": inputs,
+            "max_new_tokens": max_new_tokens,
+            "top_k": top_k if top_k > 0 else None,
+            "top_p": top_p,
+            "temperature": temperature,
+            "do_sample": temperature > 0.0,  # Enable sampling if temperature > 0
+            "streamer": streamer,
+        }
+
+        # Run generation in a thread so we can stream the output
+        thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
+        thread.start()
+
+        # Yield tokens as they become available
+        for text in streamer:
+            yield text
+
+    def _generate_pytorch(
+        self, prompt: str, max_new_tokens: int, temperature: float, top_p: float, top_k: int, stream: bool
+    ):
+        """Generate using PyTorch backend."""
+        # Tokenize
+        inputs = self.tokenizer.encode(prompt, return_tensors="pt").to(self.model.device)
+
+        if stream:
+            return self._generate_streaming(
+                inputs, max_new_tokens, temperature, top_p, top_k
+            )
+        else:
+            return self._generate_non_streaming(
+                inputs, max_new_tokens, temperature, top_p, top_k
+            )
+
+    def _generate_llaisys(
+        self, prompt: str, max_new_tokens: int, temperature: float, top_p: float, top_k: int, stream: bool
+    ):
+        """Generate using LLAISYS backend."""
+        # Encode prompt
+        input_ids = self.tokenizer.encode(prompt)
+
+        # Generate with LLAISYS (always returns full text, no streaming)
+        output_ids = self.model.generate(
+            input_ids,
+            max_new_tokens=max_new_tokens,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+        )
+
+        full_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
+
+        if stream:
+            # Convert to streaming by splitting into tokens
+            for token_id in output_ids[len(input_ids):]:
+                token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
+                yield token_text
+        else:
+            return full_text
+
+
+# ============================================================================
+# FastAPI Application
+# ============================================================================
+
+app = FastAPI(title="LLM Chat API", version="1.0.0")
+
+# Global model manager
+model_manager: Optional[ModelManager] = None
+
+
+def get_model_manager() -> ModelManager:
+    """Get or initialize the global model manager."""
+    global model_manager
+    if model_manager is None:
+        raise RuntimeError("Model manager not initialized")
+    return model_manager
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize model on startup."""
+    global model_manager
+    device = os.environ.get("DEVICE", "cpu")
+    model_path = os.environ.get("MODEL_PATH", None)
+    model_id = os.environ.get("MODEL_ID", "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
+    backend = os.environ.get("BACKEND", "pytorch")
+    temperature = float(os.environ.get("TEMPERATURE", "0.8"))
+    top_p = float(os.environ.get("TOP_P", "0.8"))
+    top_k = int(os.environ.get("TOP_K", "50"))
+
+    print(f"Initializing model manager")
+    print(f"  device={device}, backend={backend}")
+    print(f"  temperature={temperature}, top_p={top_p}, top_k={top_k}")
+
+    model_manager = ModelManager(
+        device=device,
+        model_path=model_path,
+        backend=backend,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+    )
+    model_manager.load_model(model_id=model_id)
+
+
+# ============================================================================
+# API Endpoints
+# ============================================================================
+
+@app.get("/v1/models")
+async def list_models():
+    """List available models."""
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "qwen-1.5b",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "llaisys",
+            }
+        ],
+    }
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: ChatCompletionRequest):
+    """Chat completions endpoint (OpenAI compatible)."""
+    manager = get_model_manager()
+
+    # Build prompt from messages
+    prompt = _build_prompt_from_messages(manager, request.messages)
+
+    if request.stream:
+        return StreamingResponse(
+            _stream_chat_completion(manager, request, prompt),
+            media_type="text/event-stream",
+        )
+    else:
+        return _non_streaming_chat_completion(manager, request, prompt)
+
+
+def _non_streaming_chat_completion(
+    manager: ModelManager, request: ChatCompletionRequest, prompt: str
+):
+    """Generate non-streaming chat completion."""
+    # Generate response
+    response_text = manager.generate(
+        prompt=prompt,
+        max_new_tokens=request.max_tokens,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        top_k=request.top_k,
+        stream=False,
+    )
+
+    # Create response
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    choice = ChatCompletionChoice(
+        index=0,
+        message=ChatMessage(role="assistant", content=response_text),
+        finish_reason="stop",
+    )
+
+    response = ChatCompletionResponse(
+        id=completion_id,
+        created=int(time.time()),
+        model=request.model,
+        choices=[choice],
+        usage={
+            "prompt_tokens": len(manager.tokenizer.encode(prompt)),
+            "completion_tokens": len(manager.tokenizer.encode(response_text)),
+            "total_tokens": len(manager.tokenizer.encode(prompt + response_text)),
+        },
+    )
+
+    return response.model_dump()
+
+
+async def _stream_chat_completion(
+    manager: ModelManager, request: ChatCompletionRequest, prompt: str
+):
+    """Stream chat completion as server-sent events."""
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created_time = int(time.time())
+
+    # Generate tokens
+    for token in manager.generate(
+        prompt=prompt,
+        max_new_tokens=request.max_tokens,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        top_k=request.top_k,
+        stream=True,
+    ):
+        # Create streaming response chunk
+        chunk = ChatCompletionStreamResponse(
+            id=completion_id,
+            created=created_time,
+            model=request.model,
+            choices=[
+                ChatCompletionStreamChoice(
+                    index=0,
+                    delta={"content": token},
+                    finish_reason=None,
+                )
+            ],
+        )
+
+        yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+
+    # Send final chunk with finish_reason
+    end_chunk = ChatCompletionStreamResponse(
+        id=completion_id,
+        created=created_time,
+        model=request.model,
+        choices=[ChatCompletionStreamChoice(index=0, delta={}, finish_reason="stop")],
+    )
+
+    yield f"data: {json.dumps(end_chunk.model_dump())}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+def _build_prompt_from_messages(
+    manager: ModelManager, messages: List[ChatMessage]
+) -> str:
+    """Build a prompt string from chat messages using the tokenizer's chat template."""
+    conversation = [{"role": msg.role, "content": msg.content} for msg in messages]
+
+    prompt = manager.tokenizer.apply_chat_template(
+        conversation=conversation,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+
+    return prompt
+
+
+# ============================================================================
+# Health Check
+# ============================================================================
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+@app.get("/")
+async def root():
+    """Root endpoint."""
+    return {
+        "name": "LLM Chat Server",
+        "version": "1.0.0",
+        "documentation": "/docs",
+    }
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+if __name__ == "__main__":
+    import argparse
+    import uvicorn
+
+    parser = argparse.ArgumentParser(description="LLM Chat Server")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Local model path or Hugging Face model ID",
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["pytorch", "llaisys"],
+        default="pytorch",
+        help="Inference backend (default: pytorch)",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        choices=["cpu", "nvidia"],
+        help="Device to use (default: cpu)",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.8,
+        help="Sampling temperature (default: 0.8)",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=0.8,
+        help="Top-p (nucleus) sampling parameter (default: 0.8)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=50,
+        help="Top-k sampling parameter (default: 50)",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="0.0.0.0",
+        help="Server host (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Server port (default: 8000)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of workers (default: 1)",
+    )
+
+    args = parser.parse_args()
+
+    # Set environment variables from command line arguments
+    os.environ["DEVICE"] = args.device
+    os.environ["BACKEND"] = args.backend
+    os.environ["TEMPERATURE"] = str(args.temperature)
+    os.environ["TOP_P"] = str(args.top_p)
+    os.environ["TOP_K"] = str(args.top_k)
+    if args.model:
+        os.environ["MODEL_PATH"] = args.model
+
+    print(f"Starting server on {args.host}:{args.port}")
+    if args.model:
+        print(f"Model: {args.model}")
+    print(f"Backend: {args.backend}")
+    print(f"Device: {args.device}")
+    print(f"Sampling: temperature={args.temperature}, top_p={args.top_p}, top_k={args.top_k}")
+    uvicorn.run(app, host=args.host, port=args.port, workers=args.workers)
