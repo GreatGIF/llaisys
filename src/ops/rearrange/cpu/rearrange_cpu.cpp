@@ -8,7 +8,6 @@ template <typename T>
 void rearrange_(T *out, const T *in, const std::vector<size_t> &shape,
                 const std::vector<ptrdiff_t> &out_strides,
                 const std::vector<ptrdiff_t> &in_strides, size_t ndim) {
-    std::vector<size_t> index(ndim, 0);
     size_t total_elems = 1;
     for (size_t i = 0; i < ndim; i++) {
         total_elems *= shape[i];
@@ -18,23 +17,15 @@ void rearrange_(T *out, const T *in, const std::vector<size_t> &shape,
     #pragma omp parallel for schedule(static) if (total_elems >= 4096)
 #endif
     for (size_t i = 0; i < total_elems; i++) {
+        size_t tmp_idx = i;
         ptrdiff_t out_offset = 0, in_offset = 0;
-        for (size_t j = 0; j < ndim; j++) {
-            out_offset += static_cast<ptrdiff_t>(index[j]) * out_strides[j];
-            in_offset += static_cast<ptrdiff_t>(index[j]) * in_strides[j];
+        for (size_t j = ndim - 1; j < ndim; j--) {
+            size_t coord= tmp_idx % shape[j];
+            tmp_idx /= shape[j];
+            out_offset += coord * out_strides[j];
+            in_offset += coord * in_strides[j];
         }
         out[out_offset] = in[in_offset];
-
-        int dim_idx = static_cast<int>(ndim) - 1;
-        while (dim_idx >= 0) {
-            if (index[dim_idx] == shape[dim_idx] - 1) {
-                index[dim_idx] = 0;
-                dim_idx--;
-            } else {
-                index[dim_idx]++;
-                break;
-            }
-        }
     }
 }
 
