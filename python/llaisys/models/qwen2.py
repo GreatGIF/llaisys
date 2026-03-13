@@ -106,16 +106,13 @@ class Qwen2:
         top_k: int = 0,                     # 0 to disable
         top_p: float = 0.0,                 # 0 to disable
         seed: int = 0,
+        stream: bool = False,
     ):
         # New request/session: clear backend decode cursor/KV-cache position.
         LIB_LLAISYS.llaisysQwen2ModelReset(self._model)
 
-        output_tokens = []
-        curr_inputs = list(inputs)
-        output_tokens.extend(curr_inputs)
-        
-        
         from ..libllaisys.models import LlaisysQwen2SamplingParams
+
         # Seed policy:
         # - seed == 0: non-deterministic per generation call (random base seed)
         # - seed != 0: deterministic/reproducible across runs
@@ -127,32 +124,39 @@ class Qwen2:
             seed=base_seed
         )
         sampling_params_ptr = ctypes.byref(sampling_params)
-        
-        # 推理
-        for step in range(max_new_tokens or 2048):
-            # Avoid resetting RNG state every token: advance seed by decoding step.
-            # This keeps one run stochastic while preserving reproducibility when
-            # user provides a fixed non-zero seed.
-            # sampling_params.seed = ctypes.c_uint64((base_seed + step) & 0xFFFFFFFFFFFFFFFF).value
 
-            token_ids = (ctypes.c_int64 * len(curr_inputs))(*curr_inputs)
-            
-            # Infer next token
-            next_token = LIB_LLAISYS.llaisysQwen2ModelInfer(
-                self._model,
-                token_ids,
-                ctypes.c_size_t(len(curr_inputs)),
-                sampling_params_ptr
-            )
-            
-            output_tokens.append(int(next_token))
-            
-            # 检测end_token
-            if next_token == self.end_token:
-                break
-            
-            # 实现KV cache的时候, 只需传入最新的token
-            # todo: KV cache超出的时候, 需要传入历史的token
-            curr_inputs = [next_token]
+        def _token_generator():
+            curr_inputs = list(inputs)
+            for step in range(max_new_tokens or 2048):
+                # Avoid resetting RNG state every token: advance seed by decoding step.
+                # This keeps one run stochastic while preserving reproducibility when
+                # user provides a fixed non-zero seed.
+                # sampling_params.seed = ctypes.c_uint64((base_seed + step) & 0xFFFFFFFFFFFFFFFF).value
 
+                token_ids = (ctypes.c_int64 * len(curr_inputs))(*curr_inputs)
+
+                # Infer next token
+                next_token = LIB_LLAISYS.llaisysQwen2ModelInfer(
+                    self._model,
+                    token_ids,
+                    ctypes.c_size_t(len(curr_inputs)),
+                    sampling_params_ptr
+                )
+
+                next_token = int(next_token)
+                yield next_token
+
+                # 检测end_token
+                if next_token == self.end_token:
+                    break
+
+                # 实现KV cache的时候, 只需传入最新的token
+                # todo: KV cache超出的时候, 需要传入历史的token
+                curr_inputs = [next_token]
+
+        if stream:
+            return _token_generator()
+
+        output_tokens = list(inputs)
+        output_tokens.extend(_token_generator())
         return output_tokens

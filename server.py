@@ -133,7 +133,7 @@ class ModelManager:
             return "auto"  # auto device map for CUDA
         return "cpu"
 
-    def load_model(self, model_id: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"):
+    def load_model(self, model_id: str = "Qwen/Qwen2.5-1.5B"):
         """Load tokenizer and model."""
         if self.tokenizer is not None and self.model is not None:
             return  # Already loaded
@@ -287,27 +287,33 @@ class ModelManager:
         # Encode prompt
         input_ids = self.tokenizer.encode(prompt)
 
-        # Generate with LLAISYS (always returns full text, no streaming)
-        output_ids = self.model.generate(
-            input_ids,
-            max_new_tokens=max_new_tokens,
-            top_k=top_k,
-            top_p=top_p,
-            temperature=temperature,
-            seed=seed,
-        )
-
-        full_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
-
         if stream:
-            # Convert to streaming by splitting into tokens
+            # True streaming: backend yields token ids as they are generated.
             def _token_generator():
-                for token_id in output_ids[len(input_ids):]:
+                for token_id in self.model.generate(
+                    input_ids,
+                    max_new_tokens=max_new_tokens,
+                    top_k=top_k,
+                    top_p=top_p,
+                    temperature=temperature,
+                    seed=seed,
+                    stream=True,
+                ):
                     token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
                     yield token_text
 
             return _token_generator()
         else:
+            output_ids = self.model.generate(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+                seed=seed,
+                stream=False,
+            )
+            full_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
             return full_text
 
 
@@ -335,7 +341,7 @@ async def startup_event():
     global model_manager
     device = os.environ.get("DEVICE", "cpu")
     model_path = os.environ.get("MODEL_PATH", None)
-    model_id = os.environ.get("MODEL_ID", "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
+    model_id = os.environ.get("MODEL_ID", "Qwen/Qwen2.5-1.5B")
     backend = os.environ.get("BACKEND", "pytorch")
     temperature = float(os.environ.get("TEMPERATURE", "0.8"))
     top_p = float(os.environ.get("TOP_P", "0.8"))
