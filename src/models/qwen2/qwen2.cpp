@@ -276,18 +276,15 @@ int64_t Qwen2Model::infer(int64_t *token_ids, size_t ntoken) {
     auto logits = _logits;
     ops::linear(logits, x_last_norm, _out_embed, nullptr);
 
-    // 6. Argmax
-    auto next_token_idx = Tensor::create({1}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU, 0);
-    auto max_val = Tensor::create({1}, _meta.dtype, LLAISYS_DEVICE_CPU, 0);
+    // 6. Argmax (on GPU if available, only transfer result back to CPU)
+    auto next_token_idx = Tensor::create({1}, LLAISYS_DTYPE_I64, _device_type, _device_id);
+    auto max_val = Tensor::create({1}, _meta.dtype, _device_type, _device_id);
 
-    // Argmax expects input on CPU usually if labels are on CPU
-    if (_device_type == LLAISYS_DEVICE_CPU) {
-        ops::argmax(next_token_idx, max_val, logits->view({_meta.voc}));
-    } else {
-        ops::argmax(next_token_idx, max_val, logits->to(LLAISYS_DEVICE_CPU, 0)->view({_meta.voc}));
-    }
+    ops::argmax(next_token_idx, max_val, logits->view({_meta.voc}));
 
-    return *(int64_t *)next_token_idx->data();
+    // Transfer result from device to CPU for return
+    auto next_token_idx_cpu = next_token_idx->to(LLAISYS_DEVICE_CPU, 0);
+    return *(int64_t *)next_token_idx_cpu->data();
 }
 
 } // namespace llaisys::models

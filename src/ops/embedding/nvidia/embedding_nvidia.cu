@@ -9,18 +9,23 @@
 
 template<typename T>
 __global__ void embedding_kernel(T *out, const std::int64_t *index, const T *weight, size_t index_size, size_t row_size) {
+    size_t total_elements = index_size * row_size;
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < index_size) {
-        for (size_t j = 0; j < row_size; j++) {
-            out[idx * row_size + j] = weight[index[idx] * row_size + j];
-        }
+    size_t stride = blockDim.x * gridDim.x;
+
+    for (size_t i = idx; i < total_elements; i += stride) {
+        size_t row_idx = i / row_size;
+        size_t col_idx = i % row_size;
+        std::int64_t token_id = index[row_idx];
+        size_t src_offset = token_id * row_size + col_idx;
+        out[i] = weight[src_offset];
     }
 }
 
 namespace llaisys::ops::nvidia {
 void embedding(std::byte *out, const std::int64_t *index, const std::byte *weight, llaisysDataType_t type, size_t index_size, size_t row_size) {
     int threads_per_block = 256;
-    int blocks_per_grid = (index_size + threads_per_block - 1) / threads_per_block;
+    int blocks_per_grid = (index_size * row_size + threads_per_block - 1) / threads_per_block;
 
     switch (type) {
     case LLAISYS_DTYPE_F32:

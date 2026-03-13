@@ -82,38 +82,15 @@ __global__ void cast_float_to_lowp_kernel(T *dst, const float *src, size_t count
     dst[idx] = llaisys::utils::nvidia::from_float<T>(src[idx]);
 }
 
-
-// ========================
-// 2. GEMM Wrappers
-// ========================
 template <typename T>
-void qk_gemm(cublasHandle_t handle, const T *q_head, const T *k_head,
-             float *score_head, size_t qlen, size_t kvlen, size_t hd) {
-    const int m = static_cast<int>(kvlen);
-    const int n = static_cast<int>(qlen);
-    const int k = static_cast<int>(hd);
-
-    const float alpha = 1.0f, beta = 0.0f;
-    if constexpr (std::is_same_v<T, float>) {
-        LLAISYS_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k,
-                                         &alpha, k_head, k, q_head, k, &beta, score_head, m));
-    } else if constexpr (std::is_same_v<T, half>) {
-        LLAISYS_CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k,
-                                          &alpha, k_head, CUDA_R_16F, k,
-                                          q_head, CUDA_R_16F, k,
-                                          &beta, score_head, CUDA_R_32F, m,
-                                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
-        LLAISYS_CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k,
-                                          &alpha, k_head, CUDA_R_16BF, k,
-                                          q_head, CUDA_R_16BF, k,
-                                          &beta, score_head, CUDA_R_32F, m,
-                                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    }
+__global__ void cast_lowp_to_float_kernel(float *dst, const T *src, size_t count) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+    dst[idx] = llaisys::utils::nvidia::to_float<T>(src[idx]);
 }
 
 // ========================
-// 3. Helper Utilities
+// 2. Helper Utilities
 // ========================
 template <typename T>
 inline void copy_head_matrix_async(T *dst, const T *src,
@@ -128,7 +105,7 @@ inline void copy_head_matrix_async(T *dst, const T *src,
 }
 
 // ========================
-// 4. Core Implementation
+// 3. Core Implementation
 // ========================
 template <typename T>
 void compute_query_key(cublasHandle_t handle,
@@ -146,7 +123,27 @@ void compute_query_key(cublasHandle_t handle,
         copy_head_matrix_async(q_head_buf, q_head_src, hd, nh * hd, hd, qlen, stream);
         copy_head_matrix_async(k_head_buf, k_head_src, hd, nkvh * hd, hd, kvlen, stream);
 
-        qk_gemm(handle, q_head_buf, k_head_buf, score_head, qlen, kvlen, hd);
+        const int m = static_cast<int>(kvlen);
+        const int n = static_cast<int>(qlen);
+        const int k = static_cast<int>(hd);
+
+        const float alpha = 1.0f, beta = 0.0f;
+        if constexpr (std::is_same_v<T, float>) {
+            LLAISYS_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k,
+                                            &alpha, k_head_buf, k, q_head_buf, k, &beta, score_head, m));
+        } else if constexpr (std::is_same_v<T, half>) {
+            LLAISYS_CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k,
+                                            &alpha, k_head_buf, CUDA_R_16F, k,
+                                            q_head_buf, CUDA_R_16F, k,
+                                            &beta, score_head, CUDA_R_32F, m,
+                                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
+            LLAISYS_CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k,
+                                            &alpha, k_head_buf, CUDA_R_16BF, k,
+                                            q_head_buf, CUDA_R_16BF, k,
+                                            &beta, score_head, CUDA_R_32F, m,
+                                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
     }
 }
 
@@ -155,9 +152,10 @@ void compute_atteion_value(cublasHandle_t handle,
                    T *out_ptr,
                    const float *attn_score,
                    const T *v_ptr,
-                   T *v_head_buf, T *score_head_buf, T *out_head_buf,
+                   T *v_head_buf, float *v_head_buf_f32, float *score_head_buf, float *out_head_buf_f32,
+                   T *out_head_buf,
                    size_t qlen, size_t kvlen, size_t nh, size_t nkvh, size_t hd, size_t ng,
-                   int threads, cudaStream_t stream) {
+                   cudaStream_t stream) {
     for (size_t head = 0; head < nh; ++head) {
         size_t kv_head = head / ng;
         const T *v_head_src = v_ptr + kv_head * hd;
@@ -174,31 +172,37 @@ void compute_atteion_value(cublasHandle_t handle,
 
         if constexpr (std::is_same_v<T, float>) {
             LLAISYS_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k,
-                                             &alpha, v_head_buf, m, score_head, k, &beta, out_head_buf, m));
+                                             &alpha, v_head_buf, m, score_head, k, &beta, out_head_buf_f32, m));
         } else {
-            // Cast score from float to lowp
-            size_t cnt = qlen * kvlen;
-            int blocks = (cnt + threads - 1) / threads;
-            cast_float_to_lowp_kernel<<<blocks, threads, 0, stream>>>(score_head_buf, score_head, cnt);
+            constexpr int THREADS = 256;
+
+            // Cast V from lowp to fp32 for broad cuBLAS compatibility
+            size_t v_count = kvlen * hd;
+            int v_blocks = static_cast<int>((v_count + THREADS - 1) / THREADS);
+            cast_lowp_to_float_kernel<<<v_blocks, THREADS, 0, stream>>>(v_head_buf_f32, v_head_buf, v_count);
             LLAISYS_CUDA_CHECK(cudaGetLastError());
 
-            // AV GEMM in low precision
-            if constexpr (std::is_same_v<T, half>) {
-                LLAISYS_CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k,
-                                                  &alpha, v_head_buf, CUDA_R_16F, m,
-                                                  score_head_buf, CUDA_R_16F, k,
-                                                  &beta, out_head_buf, CUDA_R_16F, m,
-                                                  CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-            } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
-                LLAISYS_CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k,
-                                                  &alpha, v_head_buf, CUDA_R_16BF, m,
-                                                  score_head_buf, CUDA_R_16BF, k,
-                                                  &beta, out_head_buf, CUDA_R_16BF, m,
-                                                  CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-            }
+            // Keep score in fp32 to avoid precision loss on BF16/FP16 models
+            LLAISYS_CUDA_CHECK(cudaMemcpyAsync(
+                score_head_buf, score_head, qlen * kvlen * sizeof(float),
+                cudaMemcpyDeviceToDevice, stream));
+
+            // AV GEMM in fp32
+            LLAISYS_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k,
+                                             &alpha, v_head_buf_f32, m, score_head_buf, k,
+                                             &beta, out_head_buf_f32, m));
+
+            size_t out_count = qlen * hd;
+            int out_blocks = static_cast<int>((out_count + THREADS - 1) / THREADS);
+            cast_float_to_lowp_kernel<<<out_blocks, THREADS, 0, stream>>>(out_head_buf, out_head_buf_f32, out_count);
+            LLAISYS_CUDA_CHECK(cudaGetLastError());
         }
 
-        copy_head_matrix_async(out_head_dst, out_head_buf, nh * hd, hd, hd, qlen, stream);
+        if constexpr (std::is_same_v<T, float>) {
+            copy_head_matrix_async(out_head_dst, reinterpret_cast<T *>(out_head_buf_f32), nh * hd, hd, hd, qlen, stream);
+        } else {
+            copy_head_matrix_async(out_head_dst, out_head_buf, nh * hd, hd, hd, qlen, stream);
+        }
     }
 }
 
@@ -218,13 +222,18 @@ void self_attention_impl(std::byte *attn_val, const std::byte *q,
     size_t score_count = nh * qlen * kvlen;
     float *attn_score = nullptr;
     T *q_head_buf = nullptr, *k_head_buf = nullptr, *v_head_buf = nullptr;
-    T *score_head_buf = nullptr, *out_head_buf = nullptr;
+    float *v_head_buf_f32 = nullptr;
+    float *score_head_buf = nullptr;
+    float *out_head_buf_f32 = nullptr;
+    T *out_head_buf = nullptr;
 
     LLAISYS_CUDA_CHECK(cudaMalloc(&attn_score, score_count * sizeof(float)));
     LLAISYS_CUDA_CHECK(cudaMalloc(&q_head_buf, qlen * hd * sizeof(T)));
     LLAISYS_CUDA_CHECK(cudaMalloc(&k_head_buf, kvlen * hd * sizeof(T)));
     LLAISYS_CUDA_CHECK(cudaMalloc(&v_head_buf, kvlen * hd * sizeof(T)));
-    LLAISYS_CUDA_CHECK(cudaMalloc(&score_head_buf, qlen * kvlen * sizeof(T)));
+    LLAISYS_CUDA_CHECK(cudaMalloc(&v_head_buf_f32, kvlen * hd * sizeof(float)));
+    LLAISYS_CUDA_CHECK(cudaMalloc(&score_head_buf, qlen * kvlen * sizeof(float)));
+    LLAISYS_CUDA_CHECK(cudaMalloc(&out_head_buf_f32, qlen * hd * sizeof(float)));
     LLAISYS_CUDA_CHECK(cudaMalloc(&out_head_buf, qlen * hd * sizeof(T)));
 
     cublasHandle_t handle = nullptr;
@@ -258,19 +267,21 @@ void self_attention_impl(std::byte *attn_val, const std::byte *q,
 
         // AV
         compute_atteion_value(handle, out_ptr, attn_score, v_ptr,
-                      v_head_buf, score_head_buf, out_head_buf,
-                      qlen, kvlen, nh, nkvh, hd, ng, THREADS, stream);
+                      v_head_buf, v_head_buf_f32, score_head_buf, out_head_buf_f32, out_head_buf,
+                      qlen, kvlen, nh, nkvh, hd, ng, stream);
 
     } catch (...) {
         cublasDestroy(handle);
-        cudaFree(out_head_buf); cudaFree(score_head_buf); cudaFree(v_head_buf);
+        cudaFree(out_head_buf); cudaFree(out_head_buf_f32); cudaFree(score_head_buf); cudaFree(v_head_buf_f32); cudaFree(v_head_buf);
         cudaFree(k_head_buf); cudaFree(q_head_buf); cudaFree(attn_score);
         throw;
     }
 
     LLAISYS_CUBLAS_CHECK(cublasDestroy(handle));
     LLAISYS_CUDA_CHECK(cudaFree(out_head_buf));
+    LLAISYS_CUDA_CHECK(cudaFree(out_head_buf_f32));
     LLAISYS_CUDA_CHECK(cudaFree(score_head_buf));
+    LLAISYS_CUDA_CHECK(cudaFree(v_head_buf_f32));
     LLAISYS_CUDA_CHECK(cudaFree(v_head_buf));
     LLAISYS_CUDA_CHECK(cudaFree(k_head_buf));
     LLAISYS_CUDA_CHECK(cudaFree(q_head_buf));
