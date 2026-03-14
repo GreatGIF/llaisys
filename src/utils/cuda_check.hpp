@@ -1,10 +1,19 @@
 #pragma once
 
 #ifdef ENABLE_NVIDIA_API
-
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#define _LLAISYS_CHECK_
+#endif
 
+#ifdef ENABLE_MX_API
+#include <mc_runtime.h>
+#include "mcblas.h"
+#include <cublas_api_wrapper.h>
+#define _LLAISYS_CHECK_
+#endif
+
+#ifdef _LLAISYS_CHECK_
 #include <iostream>
 #include <stdexcept>
 

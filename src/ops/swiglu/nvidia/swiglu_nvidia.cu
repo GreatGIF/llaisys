@@ -2,7 +2,7 @@
 
 #include "../../../utils.hpp"
 #include "../../../utils/nvidia_cast.cuh"
-#include "../../../utils/nvidia_check.cuh"
+#include "../../../utils/cuda_check.hpp"
 
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>

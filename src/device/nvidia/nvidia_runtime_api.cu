@@ -1,5 +1,5 @@
 #include "../runtime_api.hpp"
-#include "../../utils/nvidia_check.cuh"
+#include "../../utils/cuda_check.hpp"
 
 #include <cstdlib>
 #include <cstring>

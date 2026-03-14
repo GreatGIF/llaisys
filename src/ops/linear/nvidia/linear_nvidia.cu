@@ -3,7 +3,7 @@
 #include "../../../core/llaisys_core.hpp"
 #include "../../../utils.hpp"
 #include "../../../utils/nvidia_cast.cuh"
-#include "../../../utils/nvidia_check.cuh"
+#include "../../../utils/cuda_check.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>

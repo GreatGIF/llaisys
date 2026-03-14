@@ -2,7 +2,7 @@
 
 #include "../../../utils.hpp"
 #include "../../../utils/nvidia_cast.cuh"
-#include "../../../utils/nvidia_check.cuh"
+#include "../../../utils/cuda_check.hpp"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
