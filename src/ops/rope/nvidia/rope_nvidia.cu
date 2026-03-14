@@ -1,7 +1,7 @@
 #include "rope_nvidia.cuh"
 
 #include "../../../utils.hpp"
-#include "../../../utils/nvidia_cast.cuh"
+#include "../../../utils/cuda_cast.hpp"
 #include "../../../utils/cuda_check.hpp"
 
 #include <cuda_runtime.h>
@@ -36,11 +36,11 @@ __global__ void rope_kernel(T *out, const T *in, const std::int64_t *pos_ids,
     const float sin = sinf(freq);
     const float cos = cosf(freq);
 
-    const float x1 = llaisys::utils::nvidia::to_float(in[idx1]);
-    const float x2 = llaisys::utils::nvidia::to_float(in[idx2]);
+    const float x1 = llaisys::utils::cuda::to_float(in[idx1]);
+    const float x2 = llaisys::utils::cuda::to_float(in[idx2]);
 
-    out[idx1] = llaisys::utils::nvidia::from_float<T>(x1 * cos - x2 * sin);
-    out[idx2] = llaisys::utils::nvidia::from_float<T>(x1 * sin + x2 * cos);
+    out[idx1] = llaisys::utils::cuda::from_float<T>(x1 * cos - x2 * sin);
+    out[idx2] = llaisys::utils::cuda::from_float<T>(x1 * sin + x2 * cos);
 }
 
 namespace llaisys::ops::nvidia {

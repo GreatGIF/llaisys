@@ -70,4 +70,4 @@ inline void cublas_check(cublasStatus_t st, const char *call, const char *file, 
 #define LLAISYS_CUBLAS_CHECK(CALL__) \
     ::llaisys::utils::cublas_check((CALL__), #CALL__, __FILE__, __LINE__, __func__)
 
-#endif // ENABLE_NVIDIA_API
+#endif // _LLAISYS_CHECK_

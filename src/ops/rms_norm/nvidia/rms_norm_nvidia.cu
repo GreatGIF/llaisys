@@ -1,7 +1,7 @@
 #include "rms_norm_nvidia.cuh"
 
 #include "../../../utils.hpp"
-#include "../../../utils/nvidia_cast.cuh"
+#include "../../../utils/cuda_cast.hpp"
 #include "../../../utils/cuda_check.hpp"
 
 #include <cuda_runtime.h>
@@ -17,7 +17,7 @@ __global__ void rms_norm_inv_rms_kernel(float *inv_rms, const T *in, size_t m,
 
     float local_sum = 0.0f;
     for (size_t col = threadIdx.x; col < n; col += blockDim.x) {
-        float x = llaisys::utils::nvidia::to_float(in[row * n + col]);
+        float x = llaisys::utils::cuda::to_float(in[row * n + col]);
         local_sum += x * x;
     }
 
@@ -51,10 +51,10 @@ __global__ void rms_norm_apply_kernel(T *out, const T *in, const T *weight,
     size_t row = idx / n;
     size_t col = idx % n;
 
-    float x = llaisys::utils::nvidia::to_float(in[idx]);
-    float w = llaisys::utils::nvidia::to_float(weight[col]);
+    float x = llaisys::utils::cuda::to_float(in[idx]);
+    float w = llaisys::utils::cuda::to_float(weight[col]);
     float y = x * w * inv_rms[row];
-    out[idx] = llaisys::utils::nvidia::from_float<T>(y);
+    out[idx] = llaisys::utils::cuda::from_float<T>(y);
 }
 
 namespace llaisys::ops::nvidia {

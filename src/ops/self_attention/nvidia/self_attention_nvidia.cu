@@ -2,7 +2,7 @@
 
 #include "../../../core/llaisys_core.hpp"
 #include "../../../utils.hpp"
-#include "../../../utils/nvidia_cast.cuh"
+#include "../../../utils/cuda_cast.hpp"
 #include "../../../utils/cuda_check.hpp"
 
 #include <cublas_v2.h>
@@ -79,14 +79,14 @@ template <typename T>
 __global__ void cast_float_to_lowp_kernel(T *dst, const float *src, size_t count) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
-    dst[idx] = llaisys::utils::nvidia::from_float<T>(src[idx]);
+    dst[idx] = llaisys::utils::cuda::from_float<T>(src[idx]);
 }
 
 template <typename T>
 __global__ void cast_lowp_to_float_kernel(float *dst, const T *src, size_t count) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
-    dst[idx] = llaisys::utils::nvidia::to_float<T>(src[idx]);
+    dst[idx] = llaisys::utils::cuda::to_float<T>(src[idx]);
 }
 
 // ========================

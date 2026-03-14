@@ -1,7 +1,7 @@
 #include "swiglu_nvidia.cuh"
 
 #include "../../../utils.hpp"
-#include "../../../utils/nvidia_cast.cuh"
+#include "../../../utils/cuda_cast.hpp"
 #include "../../../utils/cuda_check.hpp"
 
 #include <cuda_runtime.h>
@@ -16,10 +16,10 @@ __global__ void swiglu_kernel(T *out, const T *gate, const T *up, size_t total) 
         return;
     }
 
-    float gate_val = llaisys::utils::nvidia::to_float(gate[idx]);
-    float up_val = llaisys::utils::nvidia::to_float(up[idx]);
+    float gate_val = llaisys::utils::cuda::to_float(gate[idx]);
+    float up_val = llaisys::utils::cuda::to_float(up[idx]);
     float y = up_val * gate_val / (1.0f + expf(-gate_val));
-    out[idx] = llaisys::utils::nvidia::from_float<T>(y);
+    out[idx] = llaisys::utils::cuda::from_float<T>(y);
 }
 
 } // namespace

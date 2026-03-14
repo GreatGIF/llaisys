@@ -1,7 +1,7 @@
 #include "argmax_nvidia.cuh"
 
 #include "../../../utils.hpp"
-#include "../../../utils/nvidia_cast.cuh"
+#include "../../../utils/cuda_cast.hpp"
 
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
@@ -22,7 +22,7 @@ __global__ void argmax_kernel(std::int64_t *max_idx, T *max_val, const T *vals, 
 
     for (size_t i = static_cast<size_t>(tid); i < size; i += blockDim.x) {
         const T v_raw = vals[i];
-        const float v = llaisys::utils::nvidia::to_float(v_raw);
+        const float v = llaisys::utils::cuda::to_float(v_raw);
         if (v > local_best_score || (v == local_best_score && static_cast<std::int64_t>(i) < local_best_idx)) {
             local_best_score = v;
             local_best_idx = static_cast<std::int64_t>(i);

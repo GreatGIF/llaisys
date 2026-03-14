@@ -1,11 +1,18 @@
 #pragma once
 
 #ifdef ENABLE_NVIDIA_API
+#define _LLAISYS_CUDA_CAST_
+#endif
 
+#ifdef ENABLE_MX_API
+#define _LLAISYS_CUDA_CAST_
+#endif
+
+#ifdef _LLAISYS_CUDA_CAST_
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-namespace llaisys::utils::nvidia {
+namespace llaisys::utils::cuda {
 
 template <typename T>
 __device__ __forceinline__ float to_float(T v) {
@@ -37,6 +44,6 @@ __device__ __forceinline__ nv_bfloat16 from_float<nv_bfloat16>(float v) {
     return __float2bfloat16(v);
 }
 
-} // namespace llaisys::utils::nvidia
+} // namespace llaisys::utils::cuda
 
-#endif // ENABLE_NVIDIA_API
+#endif // _LLAISYS_CUDA_CAST_

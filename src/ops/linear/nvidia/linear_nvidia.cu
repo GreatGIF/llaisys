@@ -2,7 +2,7 @@
 
 #include "../../../core/llaisys_core.hpp"
 #include "../../../utils.hpp"
-#include "../../../utils/nvidia_cast.cuh"
+#include "../../../utils/cuda_cast.hpp"
 #include "../../../utils/cuda_check.hpp"
 
 #include <cublas_v2.h>
@@ -19,8 +19,8 @@ __global__ void add_bias_kernel(T *out, const T *bias, size_t M, size_t N) {
 	size_t total = M * N;
 	if (idx < total) {
 		size_t n = idx % N;
-		float v = llaisys::utils::nvidia::to_float(out[idx]) + llaisys::utils::nvidia::to_float(bias[n]);
-		out[idx] = llaisys::utils::nvidia::from_float<T>(v);
+		float v = llaisys::utils::cuda::to_float(out[idx]) + llaisys::utils::cuda::to_float(bias[n]);
+		out[idx] = llaisys::utils::cuda::from_float<T>(v);
 	}
 }
 

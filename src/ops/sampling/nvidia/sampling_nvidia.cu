@@ -1,7 +1,7 @@
 #include "sampling_nvidia.cuh"
 
 #include "../../../utils.hpp"
-#include "../../../utils/nvidia_cast.cuh"
+#include "../../../utils/cuda_cast.hpp"
 #include "../../../utils/cuda_check.hpp"
 
 #include <cuda_bf16.h>
@@ -46,10 +46,10 @@ __global__ void sampling_softmax_no_filter_kernel(std::int64_t *out, const T *lo
 		return;
 	}
 
-	float max_logit = llaisys::utils::nvidia::to_float(batch_logits[0]) * inv_temperature;
+	float max_logit = llaisys::utils::cuda::to_float(batch_logits[0]) * inv_temperature;
 	std::int32_t argmax_idx = 0;
 	for (size_t i = 1; i < vocab_size; ++i) {
-		const float s = llaisys::utils::nvidia::to_float(batch_logits[i]) * inv_temperature;
+		const float s = llaisys::utils::cuda::to_float(batch_logits[i]) * inv_temperature;
 		if (s > max_logit) {
 			max_logit = s;
 			argmax_idx = static_cast<std::int32_t>(i);
@@ -58,7 +58,7 @@ __global__ void sampling_softmax_no_filter_kernel(std::int64_t *out, const T *lo
 
 	float total_prob = 0.0f;
 	for (size_t i = 0; i < vocab_size; ++i) {
-		const float s = llaisys::utils::nvidia::to_float(batch_logits[i]) * inv_temperature;
+		const float s = llaisys::utils::cuda::to_float(batch_logits[i]) * inv_temperature;
 		total_prob += expf(s - max_logit);
 	}
 
@@ -72,7 +72,7 @@ __global__ void sampling_softmax_no_filter_kernel(std::int64_t *out, const T *lo
 	std::int32_t sampled_idx = static_cast<std::int32_t>(vocab_size - 1);
 
 	for (size_t i = 0; i < vocab_size; ++i) {
-		const float s = llaisys::utils::nvidia::to_float(batch_logits[i]) * inv_temperature;
+		const float s = llaisys::utils::cuda::to_float(batch_logits[i]) * inv_temperature;
 		const float p = expf(s - max_logit) / total_prob;
 		cumulative += p;
 		if (rand_val <= cumulative) {
@@ -104,7 +104,7 @@ __global__ void sampling_full_gpu_kernel(std::int64_t *out, const T *logits,
 	const T *batch_logits = logits + b * vocab_size;
 
 	for (size_t i = 0; i < vocab_size; ++i) {
-		scores[i] = llaisys::utils::nvidia::to_float(batch_logits[i]) * inv_temperature;
+		scores[i] = llaisys::utils::cuda::to_float(batch_logits[i]) * inv_temperature;
 		indices[i] = static_cast<std::int32_t>(i);
 	}
 
