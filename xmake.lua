@@ -51,9 +51,9 @@ end
 -- MetaX GPU (mxcc) 逻辑
 if has_config("mx-gpu") then
     -- -- ENABLE_NVIDIA_API: 保持开启，因为 .cu 源码中使用了 CUDA API（MetaX MACA 提供兼容层）
-    add_defines("ENABLE_NVIDIA_API")
+    -- add_defines("ENABLE_NVIDIA_API")
     -- ENABLE_MX_API: 用于代码中区分 MetaX 与 NVIDIA 平台的差异
-    -- add_defines("ENABLE_MX_API")
+    add_defines("ENABLE_MX_API")
     -- 加载 mxcc 工具链 & MetaX GPU 编译目标
     includes("xmake/mx.lua")
 end

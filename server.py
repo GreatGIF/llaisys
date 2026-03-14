@@ -36,6 +36,8 @@ def get_llaisys_device(device_name: str):
             return llaisys.DeviceType.CPU
         elif device_name == "nvidia":
             return llaisys.DeviceType.NVIDIA
+        elif device_name == "mx":
+            return llaisys.DeviceType.MX
         else:
             raise ValueError(f"Unsupported device name: {device_name}")
     except ImportError:

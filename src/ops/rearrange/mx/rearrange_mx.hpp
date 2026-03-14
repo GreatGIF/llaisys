@@ -1,0 +1,14 @@
+#pragma once
+
+#include "llaisys.h"
+
+#include <cstddef>
+#include <vector>
+
+namespace llaisys::ops::mx {
+void rearrange(std::byte *out, const std::byte *in, llaisysDataType_t type,
+               const std::vector<size_t> &shape,
+               const std::vector<ptrdiff_t> &out_strides,
+               const std::vector<ptrdiff_t> &in_strides,
+               size_t ndim);
+} // namespace llaisys::ops::mx
