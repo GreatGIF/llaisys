@@ -13,6 +13,12 @@ option("nv-gpu")
     set_description("Whether to compile implementations for Nvidia GPU")
 option_end()
 
+option("mx-gpu")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Whether to compile implementations for MetaX (MetaX) GPU")
+option_end()
+
 option("openmp")
     set_default(false)
     set_showmenu(true)
@@ -40,6 +46,16 @@ option_end()
 if has_config("nv-gpu") then
     add_defines("ENABLE_NVIDIA_API")
     includes("xmake/nvidia.lua")
+end
+
+-- MetaX GPU (mxcc) 逻辑
+if has_config("mx-gpu") then
+    -- -- ENABLE_NVIDIA_API: 保持开启，因为 .cu 源码中使用了 CUDA API（MetaX MACA 提供兼容层）
+    add_defines("ENABLE_NVIDIA_API")
+    -- ENABLE_MX_API: 用于代码中区分 MetaX 与 NVIDIA 平台的差异
+    -- add_defines("ENABLE_MX_API")
+    -- 加载 mxcc 工具链 & MetaX GPU 编译目标
+    includes("xmake/mx.lua")
 end
 
 if has_config("openmp") then
@@ -125,6 +141,9 @@ target("llaisys-device")
     if has_config("nv-gpu") then
         add_deps("llaisys-device-nvidia")
     end
+    if has_config("mx-gpu") then
+        add_deps("llaisys-device-mx")
+    end
 
     set_languages("cxx17")
     set_warnings("all", "error")
@@ -173,6 +192,9 @@ target("llaisys-ops")
     add_deps("llaisys-ops-cpu")
     if has_config("nv-gpu") then
         add_deps("llaisys-ops-nvidia")
+    end
+    if has_config("mx-gpu") then
+        add_deps("llaisys-ops-mx")
     end
 
     set_languages("cxx17")

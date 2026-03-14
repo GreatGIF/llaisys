@@ -7,6 +7,9 @@
 #ifdef ENABLE_NVIDIA_API
 #include "nvidia/rearrange_nvidia.cuh"
 #endif
+#ifdef ENABLE_MX_API
+#include "mx/rearrange_mx.hpp"
+#endif
 
 namespace llaisys::ops {
 void rearrange(tensor_t out, tensor_t in) {
@@ -24,6 +27,10 @@ void rearrange(tensor_t out, tensor_t in) {
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
         return nvidia::rearrange(out->data(), in->data(), out->dtype(), out->shape(), out->strides(), in->strides(), in->ndim());
+#endif
+#ifdef ENABLE_MX_API
+    case LLAISYS_DEVICE_MX:
+        return mx::rearrange(out->data(), in->data(), out->dtype(), out->shape(), out->strides(), in->strides(), in->ndim());
 #endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;

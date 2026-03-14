@@ -6,6 +6,9 @@
 #ifdef ENABLE_NVIDIA_API
 #include "nvidia/sampling_nvidia.cuh"
 #endif
+#ifdef ENABLE_MX_API
+#include "mx/sampling_mx.hpp"
+#endif
 
 namespace llaisys::ops {
 
@@ -41,6 +44,11 @@ void sampling(tensor_t out, tensor_t logits, float temperature, int32_t top_k,
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
         return nvidia::sampling(out->data(), logits->data(), logits->dtype(),
+                               batch_size, vocab_size, temperature, top_k, top_p, seed);
+#endif
+#ifdef ENABLE_MX_API
+    case LLAISYS_DEVICE_MX:
+        return mx::sampling(out->data(), logits->data(), logits->dtype(),
                                batch_size, vocab_size, temperature, top_k, top_p, seed);
 #endif
     default:

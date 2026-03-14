@@ -81,6 +81,12 @@ const LlaisysRuntimeAPI *getRuntimeAPI(llaisysDeviceType_t device_type) {
 #else
         return getUnsupportedRuntimeAPI();
 #endif
+    case LLAISYS_DEVICE_MX:
+#ifdef ENABLE_MX_API
+        return llaisys::device::mx::getRuntimeAPI();
+#else
+        return getUnsupportedRuntimeAPI();
+#endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;
         return nullptr;

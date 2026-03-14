@@ -7,9 +7,11 @@
 #endif
 
 #ifdef ENABLE_MX_API
-#include <mc_runtime.h>
-#include "mcblas.h"
-#include <cublas_api_wrapper.h>
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
+// #include <mc_runtime.h>
+// #include "mcblas.h"
+// #include <cublas_api_wrapper.h>
 #define _LLAISYS_CHECK_
 #endif
 

@@ -7,6 +7,9 @@
 #ifdef ENABLE_NVIDIA_API
 #include "nvidia/rope_nvidia.cuh"
 #endif
+#ifdef ENABLE_MX_API
+#include "mx/rope_mx.hpp"
+#endif
 
 namespace llaisys::ops {
 void rope(tensor_t out, tensor_t in, tensor_t pos_ids, float theta) {
@@ -36,6 +39,11 @@ void rope(tensor_t out, tensor_t in, tensor_t pos_ids, float theta) {
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
         return nvidia::rope(out->data(), in->data(), reinterpret_cast<const std::int64_t *>(pos_ids->data()),
+                            out->dtype(), seq_len, head_num, head_dim, theta);
+#endif
+#ifdef ENABLE_MX_API
+    case LLAISYS_DEVICE_MX:
+        return mx::rope(out->data(), in->data(), reinterpret_cast<const std::int64_t *>(pos_ids->data()),
                             out->dtype(), seq_len, head_num, head_dim, theta);
 #endif
     default:

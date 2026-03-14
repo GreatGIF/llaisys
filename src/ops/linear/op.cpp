@@ -7,6 +7,9 @@
 #ifdef ENABLE_NVIDIA_API
 #include "nvidia/linear_nvidia.cuh"
 #endif
+#ifdef ENABLE_MX_API
+#include "mx/linear_mx.hpp"
+#endif
 
 
 namespace llaisys::ops {
@@ -51,6 +54,10 @@ void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
         return nvidia::linear(out->data(), in->data(), weight->data(), (bias ? bias->data() : nullptr), out->dtype(), M, N, K);
+#endif
+#ifdef ENABLE_MX_API
+    case LLAISYS_DEVICE_MX:
+        return mx::linear(out->data(), in->data(), weight->data(), (bias ? bias->data() : nullptr), out->dtype(), M, N, K);
 #endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;

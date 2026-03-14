@@ -12,6 +12,13 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+// Some toolchain paths may not pull in SDK macro headers early enough.
+// Provide a local fallback to avoid compile errors like:
+// "unknown type name '__forceinline__'".
+#ifndef __forceinline__
+#define __forceinline__ inline __attribute__((always_inline))
+#endif
+
 namespace llaisys::utils::cuda {
 
 template <typename T>

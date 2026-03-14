@@ -6,6 +6,9 @@
 #ifdef ENABLE_NVIDIA_API
 #include "nvidia/argmax_nvidia.cuh"
 #endif
+#ifdef ENABLE_MX_API
+#include "mx/argmax_mx.hpp"
+#endif
 
 namespace llaisys::ops {
 void argmax(tensor_t max_idx, tensor_t max_val, tensor_t vals) {
@@ -27,6 +30,10 @@ void argmax(tensor_t max_idx, tensor_t max_val, tensor_t vals) {
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
         return nvidia::argmax(reinterpret_cast<int64_t *>(max_idx->data()), max_val->data(), vals->data(), vals->dtype(), vals->numel());
+#endif
+#ifdef ENABLE_MX_API
+    case LLAISYS_DEVICE_MX:
+        return mx::argmax(reinterpret_cast<int64_t *>(max_idx->data()), max_val->data(), vals->data(), vals->dtype(), vals->numel());
 #endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;

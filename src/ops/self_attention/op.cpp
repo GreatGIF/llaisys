@@ -7,6 +7,9 @@
 #ifdef ENABLE_NVIDIA_API
 #include "nvidia/self_attention_nvidia.cuh"
 #endif
+#ifdef ENABLE_MX_API
+#include "mx/self_attention_mx.hpp"
+#endif
 
 namespace llaisys::ops {
 void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float scale) {
@@ -42,6 +45,11 @@ void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float
 #ifdef ENABLE_NVIDIA_API
        case LLAISYS_DEVICE_NVIDIA:
               return nvidia::self_attention(attn_val->data(), q->data(), k->data(), v->data(),
+                                                                 attn_val->dtype(), qlen, kvlen, nh, nkvh, hd, scale);
+#endif
+#ifdef ENABLE_MX_API
+       case LLAISYS_DEVICE_MX:
+              return mx::self_attention(attn_val->data(), q->data(), k->data(), v->data(),
                                                                  attn_val->dtype(), qlen, kvlen, nh, nkvh, hd, scale);
 #endif
     default:

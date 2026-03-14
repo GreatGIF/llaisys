@@ -214,7 +214,7 @@ def main():
     parser.add_argument("--output-json", type=str, default="")
     args = parser.parse_args()
 
-    devices = ["cpu", "nvidia"] if args.device == "all" else [args.device]
+    devices = ["cpu", "nvidia", "mx"] if args.device == "all" else [args.device]
 
     all_rows: List[Dict] = []
     for d in devices:

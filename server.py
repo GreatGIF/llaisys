@@ -548,7 +548,7 @@ if __name__ == "__main__":
         "--device",
         type=str,
         default="cpu",
-        choices=["cpu", "nvidia"],
+        choices=["cpu", "nvidia", "mx"],
         help="Device to use (default: cpu)",
     )
     parser.add_argument(

@@ -40,7 +40,7 @@ def run_all_ops_tests(device: str, profile: bool) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device", default="cpu", choices=["cpu", "nvidia"], type=str)
+    parser.add_argument("--device", default="cpu", choices=["cpu", "nvidia", "mx"], type=str)
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
 
