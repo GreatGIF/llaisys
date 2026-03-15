@@ -33,8 +33,8 @@ void sampling_kernel_(int64_t *out, const T *logits, size_t batch_size, size_t v
                   [](const auto &a, const auto &b) { return a.first > b.first; });
         
         // Apply Top-K filter
-        int32_t k_size = vocab_size;
-        if (top_k > 0 && top_k < static_cast<int32_t>(vocab_size)) {
+        int32_t k_size = static_cast<int32_t>(vocab_size);
+        if (top_k > 0 && top_k < k_size) {
             k_size = top_k;
         }
         
