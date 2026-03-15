@@ -1,5 +1,5 @@
 #include "op.hpp"
-
+#include <string>
 #include "../../core/llaisys_core.hpp"
 #include "../../utils.hpp"
 #include "cpu/sampling_cpu.hpp"
