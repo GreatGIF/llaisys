@@ -100,17 +100,17 @@ namespace {
 // 	}
 // }
 
-inline bool env_flag_enabled(const char *name) {
-	const char *value = std::getenv(name);
-	if (value == nullptr) {
-		return false;
-	}
-	if (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 || std::strcmp(value, "TRUE") == 0 ||
-		std::strcmp(value, "on") == 0 || std::strcmp(value, "ON") == 0) {
-		return true;
-	}
-	return false;
-}
+// inline bool env_flag_enabled(const char *name) {
+// 	const char *value = std::getenv(name);
+// 	if (value == nullptr) {
+// 		return false;
+// 	}
+// 	if (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 || std::strcmp(value, "TRUE") == 0 ||
+// 		std::strcmp(value, "on") == 0 || std::strcmp(value, "ON") == 0) {
+// 		return true;
+// 	}
+// 	return false;
+// }
 
 inline const char *strategy_to_string(LinearCPUStrategy s) {
 	switch (s) {
@@ -540,27 +540,27 @@ void linear(std::byte *out, const std::byte *in, const std::byte *weight, const 
 					N <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
 					K <= static_cast<size_t>(std::numeric_limits<int>::max());
 	const auto selected = choose_linear_strategy(M, N, K, type, can_use_blas, can_use_onednn, can_use_mkl);
-	const bool log_backend = env_flag_enabled("LLAISYS_LINEAR_LOG_BACKEND");
-	if (log_backend) {
-		const char *dtype_str = "unknown";
-		switch (type) {
-		case LLAISYS_DTYPE_F32:
-			dtype_str = "f32";
-			break;
-		case LLAISYS_DTYPE_F16:
-			dtype_str = "f16";
-			break;
-		case LLAISYS_DTYPE_BF16:
-			dtype_str = "bf16";
-			break;
-		default:
-			break;
-		}
-		std::fprintf(stderr,
-			"[llaisys.linear.cpu] dtype=%s M=%zu N=%zu K=%zu backend=%s caps{blas=%d,onednn=%d,mkl=%d}\n",
-			dtype_str, M, N, K, strategy_to_string(selected), can_use_blas ? 1 : 0, can_use_onednn ? 1 : 0,
-			can_use_mkl ? 1 : 0);
-	}
+	// const bool log_backend = env_flag_enabled("LLAISYS_LINEAR_LOG_BACKEND");
+	// if (log_backend) {
+	// 	const char *dtype_str = "unknown";
+	// 	switch (type) {
+	// 	case LLAISYS_DTYPE_F32:
+	// 		dtype_str = "f32";
+	// 		break;
+	// 	case LLAISYS_DTYPE_F16:
+	// 		dtype_str = "f16";
+	// 		break;
+	// 	case LLAISYS_DTYPE_BF16:
+	// 		dtype_str = "bf16";
+	// 		break;
+	// 	default:
+	// 		break;
+	// 	}
+	// 	std::fprintf(stderr,
+	// 		"[llaisys.linear.cpu] dtype=%s M=%zu N=%zu K=%zu backend=%s caps{blas=%d,onednn=%d,mkl=%d}\n",
+	// 		dtype_str, M, N, K, strategy_to_string(selected), can_use_blas ? 1 : 0, can_use_onednn ? 1 : 0,
+	// 		can_use_mkl ? 1 : 0);
+	// }
 
 	switch (type) {
 	case LLAISYS_DTYPE_F32:
