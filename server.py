@@ -300,8 +300,10 @@ class ModelManager:
             # No match or first request, reset cache
             clear_kv_cache = True
             model_inputs = input_ids
-            self.cached_token_ids = input_ids.copy()
             print("KV cache not matched or first request. Clearing cache.")
+
+        # IMPORTANT: Update cache list to include the newly sent tokens!
+        self.cached_token_ids = input_ids.copy()
 
         if stream:
             # True streaming: backend yields token ids as they are generated.

@@ -138,10 +138,12 @@ Qwen2Model::~Qwen2Model() {
 void Qwen2Model::reset() {
     // Reset decode cursor for a new request/session.
     // KV cache tensors are reused and overwritten from position 0 onward.
+    // printf("--- reset ---\n");
     _cur_pos = 0;
 }
 
 int64_t Qwen2Model::infer(int64_t *token_ids, size_t ntoken, const LlaisysQwen2SamplingParams &params) {
+    // printf("--- Infer (ntoken=%zu, cur_pos=%zu) tokens ---\n", ntoken, _cur_pos);
 
     // _in_embed->slice(0, 1, 10)->debug();
     // _out_embed->slice(0, 1, 10)->debug();
