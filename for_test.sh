@@ -1,13 +1,12 @@
 set -e
-cd /root/code/llaisys && xmake f --root --openmp=y --cpu-blas=n --cpu-mkl=n --cpu-onednn=n --nv-gpu=n --mx-gpu=y -c -v
+xmake f --root --openmp=y --cpu-blas=n --cpu-mkl=n --cpu-onednn=n --nv-gpu=n --mx-gpu=y -c -v
+# cd /root/code/llaisys && xmake f --root --openmp=y --cpu-blas=n --cpu-mkl=n --cpu-onednn=n --nv-gpu=n --mx-gpu=y -c -v # 沐曦环境
 xmake --root
 xmake --root install
 
-# 兜底：当前产物在 build/**/release，确保 Python 包目录拿到所有 .so
-find build -type f -name 'lib*.so' -path '*/release/*' -exec cp -f {} python/llaisys/libllaisys/ \;
+# find build -type f -name 'lib*.so' -path '*/release/*' -exec cp -f {} python/llaisys/libllaisys/ \; # 沐曦环境
 
 export LLAISYS_LINEAR_LOG_BACKEND=1
-# export LLAISYS_LINEAR_FORCE_BACKEND=onednn
 
 # pip install -e ./python/
 # pip install ./python/

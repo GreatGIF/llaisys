@@ -90,4 +90,6 @@ ehthumbs.db
 desktop.ini
 
 # docs
-docs/
+docs/*
+
+!docs/project.md
