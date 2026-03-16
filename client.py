@@ -130,6 +130,93 @@ def chat_streaming(
         print(f"Error: {e}")
 
 
+def chat_interactive(
+    base_url: str = "http://localhost:8000",
+    model: str = "qwen-1.5b",
+    temperature: float = 0.8,
+    top_p: float = 0.8,
+    top_k: int = 50,
+    seed: int = 0,
+    max_tokens: int = 256,
+):
+    """Start an interactive chat session."""
+    print(f"\n{'='*60}")
+    print(f"Interactive Chat (Type 'quit' or 'exit' to stop, 'clear' to reset)")
+    print(f"{'='*60}\n")
+    
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."}
+    ]
+    
+    url = f"{base_url}/v1/chat/completions"
+    
+    while True:
+        try:
+            user_message = input("User: ")
+            if user_message.strip().lower() in ['quit', 'exit']:
+                break
+            if user_message.strip().lower() == 'clear':
+                messages = [{"role": "system", "content": "You are a helpful assistant."}]
+                print("Conversation history cleared.\n")
+                continue
+            if not user_message.strip():
+                continue
+                
+            messages.append({"role": "user", "content": user_message})
+            
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "seed": seed,
+                "max_tokens": max_tokens,
+                "stream": True,
+            }
+            
+            print("Assistant: ", end="", flush=True)
+            
+            response = requests.post(url, json=payload, timeout=300, stream=True)
+            response.raise_for_status()
+            
+            assistant_message = ""
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                
+                line = line.decode("utf-8") if isinstance(line, bytes) else line
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    
+                    if data_str == "[DONE]":
+                        break
+                        
+                    try:
+                        data = json.loads(data_str)
+                        if data.get("choices"):
+                            delta = data["choices"][0].get("delta", {})
+                            if "content" in delta:
+                                content = delta["content"]
+                                print(content, end="", flush=True)
+                                assistant_message += content
+                    except json.JSONDecodeError:
+                        pass
+                        
+            print("\n")
+            messages.append({"role": "assistant", "content": assistant_message})
+            
+        except KeyboardInterrupt:
+            print("\nExiting...")
+            break
+        except requests.exceptions.ConnectionError:
+            print("\nError: Could not connect to server. Make sure it's running on", base_url)
+            messages.pop()
+        except requests.exceptions.RequestException as e:
+            print(f"\nError: {e}")
+            messages.pop()
+
+
 def list_models(base_url: str = "http://localhost:8000"):
     """List available models."""
     print(f"\n{'='*60}")
@@ -214,8 +301,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--mode",
-        choices=["health", "models", "stream", "non-stream", "all"],
-        default="non-stream",
+        choices=["health", "models", "stream", "non-stream", "interactive", "all"],
+        default="interactive",
         help="Operating mode",
     )
     args = parser.parse_args()
@@ -241,6 +328,16 @@ if __name__ == "__main__":
         chat_streaming(
             base_url=args.base_url,
             user_message=args.message,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            seed=args.seed,
+            max_tokens=args.max_tokens,
+        )
+
+    if args.mode in ["interactive", "all"]:
+        chat_interactive(
+            base_url=args.base_url,
             temperature=args.temperature,
             top_p=args.top_p,
             top_k=args.top_k,
