@@ -9,6 +9,9 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <cfloat>
+#include <limits>
+#include <type_traits>
+#include <unordered_map>
 
 // ========================
 // 1. CUDA Kernels
@@ -16,17 +19,17 @@
 __global__ void scale_causal_mask_kernel(float *attn_score, size_t qlen,
                                                size_t kvlen, size_t nh,
                                                float scale) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t total = nh * qlen * kvlen;
-    if (idx >= total) return;
+    const size_t total = nh * qlen * kvlen;
+    const size_t stride = static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
+    for (size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < total; idx += stride) {
+        const size_t rem = idx % (qlen * kvlen);
+        const size_t ql = rem / kvlen;
+        const size_t kvl = rem % kvlen;
 
-    size_t rem = idx % (qlen * kvlen);
-    size_t ql = rem / kvlen;
-    size_t kvl = rem % kvlen;
-
-    long long causal_offset = static_cast<long long>(kvlen) - static_cast<long long>(qlen);
-    bool masked = static_cast<long long>(kvl) > (static_cast<long long>(ql) + causal_offset);
-    attn_score[idx] = masked ? -FLT_MAX : (attn_score[idx] * scale);
+        const long long causal_offset = static_cast<long long>(kvlen) - static_cast<long long>(qlen);
+        const bool masked = static_cast<long long>(kvl) > (static_cast<long long>(ql) + causal_offset);
+        attn_score[idx] = masked ? -FLT_MAX : (attn_score[idx] * scale);
+    }
 }
 
 __global__ void softmax_rows_kernel(float *attn_score, size_t rows, size_t kvlen) {
@@ -89,19 +92,83 @@ __global__ void cast_lowp_to_float_kernel(float *dst, const T *src, size_t count
     dst[idx] = llaisys::utils::cuda::to_float<T>(src[idx]);
 }
 
-// ========================
-// 2. Helper Utilities
-// ========================
 template <typename T>
-inline void copy_head_matrix_async(T *dst, const T *src,
-                                   size_t dst_pitch_elems, size_t src_pitch_elems,
-                                   size_t width_elems, size_t height_rows,
-                                   cudaStream_t stream) {
-    LLAISYS_CUDA_CHECK(cudaMemcpy2DAsync(
-        dst, dst_pitch_elems * sizeof(T),
-        src, src_pitch_elems * sizeof(T),
-        width_elems * sizeof(T), height_rows,
-        cudaMemcpyDeviceToDevice, stream));
+__global__ void cast_strided_lowp_to_float_kernel(float *dst, const T *src,
+                                                   size_t rows, size_t cols,
+                                                   size_t src_row_stride) {
+    const size_t total = rows * cols;
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const size_t r = idx / cols;
+    const size_t c = idx % cols;
+    dst[idx] = llaisys::utils::cuda::to_float<T>(src[r * src_row_stride + c]);
+}
+
+template <typename T>
+__global__ void cast_float_to_strided_lowp_kernel(T *dst, const float *src,
+                                                   size_t rows, size_t cols,
+                                                   size_t dst_row_stride) {
+    const size_t total = rows * cols;
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const size_t r = idx / cols;
+    const size_t c = idx % cols;
+    dst[r * dst_row_stride + c] = llaisys::utils::cuda::from_float<T>(src[idx]);
+}
+
+template <typename T>
+__global__ void cast_float_group_to_strided_lowp_kernel(T *dst, const float *src,
+                                                         size_t heads, size_t rows, size_t cols,
+                                                         size_t dst_row_stride, size_t dst_head_stride) {
+    const size_t total = heads * rows * cols;
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const size_t rc = rows * cols;
+    const size_t h = idx / rc;
+    const size_t rem = idx % rc;
+    const size_t r = rem / cols;
+    const size_t c = rem % cols;
+    dst[h * dst_head_stride + r * dst_row_stride + c] = llaisys::utils::cuda::from_float<T>(src[idx]);
+}
+
+struct SelfAttentionWorkspace {
+    int device_id{-1};
+    float *attn_score{nullptr};
+    size_t attn_score_capacity{0};
+    float *v_head_buf_f32{nullptr};
+    size_t v_head_buf_capacity{0};
+    float *out_head_buf_f32{nullptr};
+    size_t out_head_buf_capacity{0};
+};
+
+inline SelfAttentionWorkspace &workspace_for_device(int device_id) {
+    thread_local std::unordered_map<int, SelfAttentionWorkspace> workspaces;
+    auto &ws = workspaces[device_id];
+    ws.device_id = device_id;
+    return ws;
+}
+
+inline void ensure_workspace_buffer(float *&ptr, size_t &capacity, size_t required_count) {
+    if (capacity >= required_count && ptr != nullptr) {
+        return;
+    }
+    if (ptr != nullptr) {
+        LLAISYS_CUDA_CHECK(cudaFree(ptr));
+    }
+    LLAISYS_CUDA_CHECK(cudaMalloc(&ptr, required_count * sizeof(float)));
+    capacity = required_count;
+}
+
+inline cublasHandle_t cublas_handle_for_device(int device_id) {
+    thread_local std::unordered_map<int, cublasHandle_t> handles;
+    auto it = handles.find(device_id);
+    if (it != handles.end()) {
+        return it->second;
+    }
+    cublasHandle_t handle = nullptr;
+    LLAISYS_CUBLAS_CHECK(cublasCreate(&handle));
+    handles.emplace(device_id, handle);
+    return handle;
 }
 
 // ========================
@@ -111,36 +178,83 @@ template <typename T>
 void compute_query_key(cublasHandle_t handle,
                    float *attn_score,
                    const T *q_ptr, const T *k_ptr,
-                   T *q_head_buf, T *k_head_buf,
                    size_t qlen, size_t kvlen, size_t nh, size_t nkvh, size_t hd, size_t ng,
                    cudaStream_t stream) {
+    (void)stream;
+    const int m = static_cast<int>(kvlen);
+    const int n = static_cast<int>(qlen);
+    const int k = static_cast<int>(hd);
+    const int lda_q = static_cast<int>(nh * hd);
+    const int lda_k = static_cast<int>(nkvh * hd);
+
+    if constexpr (std::is_same_v<T, float>) {
+        const float alpha = 1.0f, beta = 0.0f;
+        const long long stride_b = static_cast<long long>(hd);
+        const long long stride_c = static_cast<long long>(qlen) * static_cast<long long>(kvlen);
+        for (size_t kv_head = 0; kv_head < nkvh; ++kv_head) {
+            const size_t base_head = kv_head * ng;
+            const float *k_head_src = reinterpret_cast<const float *>(k_ptr + kv_head * hd);
+            const float *q_head_src = reinterpret_cast<const float *>(q_ptr + base_head * hd);
+            float *score_head = attn_score + base_head * qlen * kvlen;
+            LLAISYS_CUBLAS_CHECK(cublasSgemmStridedBatched(
+                handle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                m, n, k,
+                &alpha,
+                k_head_src, lda_k, 0,
+                q_head_src, lda_q, stride_b,
+                &beta,
+                score_head, m, stride_c,
+                static_cast<int>(ng)));
+        }
+        return;
+    }
+
+    if constexpr (std::is_same_v<T, half> || std::is_same_v<T, nv_bfloat16>) {
+        const float alpha = 1.0f, beta = 0.0f;
+        const long long stride_b = static_cast<long long>(hd);
+        const long long stride_c = static_cast<long long>(qlen) * static_cast<long long>(kvlen);
+        const cudaDataType_t ab_type = std::is_same_v<T, half> ? CUDA_R_16F : CUDA_R_16BF;
+        for (size_t kv_head = 0; kv_head < nkvh; ++kv_head) {
+            const size_t base_head = kv_head * ng;
+            const T *k_head_src = k_ptr + kv_head * hd;
+            const T *q_head_src = q_ptr + base_head * hd;
+            float *score_head = attn_score + base_head * qlen * kvlen;
+            LLAISYS_CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+                handle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                m, n, k,
+                &alpha,
+                k_head_src, ab_type, lda_k, 0,
+                q_head_src, ab_type, lda_q, stride_b,
+                &beta,
+                score_head, CUDA_R_32F, m, stride_c,
+                static_cast<int>(ng),
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
+        return;
+    }
+
     for (size_t head = 0; head < nh; ++head) {
-        size_t kv_head = head / ng;
+        const size_t kv_head = head / ng;
         const T *q_head_src = q_ptr + head * hd;
         const T *k_head_src = k_ptr + kv_head * hd;
         float *score_head = attn_score + head * qlen * kvlen;
 
-        copy_head_matrix_async(q_head_buf, q_head_src, hd, nh * hd, hd, qlen, stream);
-        copy_head_matrix_async(k_head_buf, k_head_src, hd, nkvh * hd, hd, kvlen, stream);
-
-        const int m = static_cast<int>(kvlen);
-        const int n = static_cast<int>(qlen);
-        const int k = static_cast<int>(hd);
-
         const float alpha = 1.0f, beta = 0.0f;
         if constexpr (std::is_same_v<T, float>) {
             LLAISYS_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k,
-                                            &alpha, k_head_buf, k, q_head_buf, k, &beta, score_head, m));
+                                            &alpha, k_head_src, lda_k, q_head_src, lda_q, &beta, score_head, m));
         } else if constexpr (std::is_same_v<T, half>) {
             LLAISYS_CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k,
-                                            &alpha, k_head_buf, CUDA_R_16F, k,
-                                            q_head_buf, CUDA_R_16F, k,
+                                            &alpha, k_head_src, CUDA_R_16F, lda_k,
+                                            q_head_src, CUDA_R_16F, lda_q,
                                             &beta, score_head, CUDA_R_32F, m,
                                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
             LLAISYS_CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k,
-                                            &alpha, k_head_buf, CUDA_R_16BF, k,
-                                            q_head_buf, CUDA_R_16BF, k,
+                                            &alpha, k_head_src, CUDA_R_16BF, lda_k,
+                                            q_head_src, CUDA_R_16BF, lda_q,
                                             &beta, score_head, CUDA_R_32F, m,
                                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         }
@@ -152,57 +266,71 @@ void compute_atteion_value(cublasHandle_t handle,
                    T *out_ptr,
                    const float *attn_score,
                    const T *v_ptr,
-                   T *v_head_buf, float *v_head_buf_f32, float *score_head_buf, float *out_head_buf_f32,
-                   T *out_head_buf,
+                   float *v_head_buf_f32, float *out_head_buf_f32,
                    size_t qlen, size_t kvlen, size_t nh, size_t nkvh, size_t hd, size_t ng,
                    cudaStream_t stream) {
-    for (size_t head = 0; head < nh; ++head) {
-        size_t kv_head = head / ng;
-        const T *v_head_src = v_ptr + kv_head * hd;
-        const float *score_head = attn_score + head * qlen * kvlen;
-        T *out_head_dst = out_ptr + head * hd;
+    constexpr int THREADS = 256;
+    const int m = static_cast<int>(hd);
+    const int n = static_cast<int>(qlen);
+    const int k = static_cast<int>(kvlen);
+    const int lda_v = static_cast<int>(nkvh * hd);
+    const int ldc_out = static_cast<int>(nh * hd);
 
-        copy_head_matrix_async(v_head_buf, v_head_src, hd, nkvh * hd, hd, kvlen, stream);
-
-        // AV GEMM with optional cast
-        const int m = static_cast<int>(hd);
-        const int n = static_cast<int>(qlen);
-        const int k = static_cast<int>(kvlen);
+    if constexpr (std::is_same_v<T, float>) {
         const float alpha = 1.0f, beta = 0.0f;
-
-        if constexpr (std::is_same_v<T, float>) {
-            LLAISYS_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k,
-                                             &alpha, v_head_buf, m, score_head, k, &beta, out_head_buf_f32, m));
-        } else {
-            constexpr int THREADS = 256;
-
-            // Cast V from lowp to fp32 for broad cuBLAS compatibility
-            size_t v_count = kvlen * hd;
-            int v_blocks = static_cast<int>((v_count + THREADS - 1) / THREADS);
-            cast_lowp_to_float_kernel<<<v_blocks, THREADS, 0, stream>>>(v_head_buf_f32, v_head_buf, v_count);
-            LLAISYS_CUDA_CHECK(cudaGetLastError());
-
-            // Keep score in fp32 to avoid precision loss on BF16/FP16 models
-            LLAISYS_CUDA_CHECK(cudaMemcpyAsync(
-                score_head_buf, score_head, qlen * kvlen * sizeof(float),
-                cudaMemcpyDeviceToDevice, stream));
-
-            // AV GEMM in fp32
-            LLAISYS_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k,
-                                             &alpha, v_head_buf_f32, m, score_head_buf, k,
-                                             &beta, out_head_buf_f32, m));
-
-            size_t out_count = qlen * hd;
-            int out_blocks = static_cast<int>((out_count + THREADS - 1) / THREADS);
-            cast_float_to_lowp_kernel<<<out_blocks, THREADS, 0, stream>>>(out_head_buf, out_head_buf_f32, out_count);
-            LLAISYS_CUDA_CHECK(cudaGetLastError());
+        const long long stride_b = static_cast<long long>(qlen) * static_cast<long long>(kvlen);
+        const long long stride_c = static_cast<long long>(hd);
+        for (size_t kv_head = 0; kv_head < nkvh; ++kv_head) {
+            const size_t base_head = kv_head * ng;
+            const float *v_head_src = reinterpret_cast<const float *>(v_ptr + kv_head * hd);
+            const float *score_head = attn_score + base_head * qlen * kvlen;
+            float *out_head_dst = reinterpret_cast<float *>(out_ptr + base_head * hd);
+            LLAISYS_CUBLAS_CHECK(cublasSgemmStridedBatched(
+                handle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                m, n, k,
+                &alpha,
+                v_head_src, lda_v, 0,
+                score_head, k, stride_b,
+                &beta,
+                out_head_dst, ldc_out, stride_c,
+                static_cast<int>(ng)));
         }
+        return;
+    }
 
-        if constexpr (std::is_same_v<T, float>) {
-            copy_head_matrix_async(out_head_dst, reinterpret_cast<T *>(out_head_buf_f32), nh * hd, hd, hd, qlen, stream);
-        } else {
-            copy_head_matrix_async(out_head_dst, out_head_buf, nh * hd, hd, hd, qlen, stream);
-        }
+    const float alpha = 1.0f, beta = 0.0f;
+    const long long stride_b = static_cast<long long>(qlen) * static_cast<long long>(kvlen);
+    const long long stride_c = static_cast<long long>(qlen) * static_cast<long long>(hd);
+    for (size_t kv_head = 0; kv_head < nkvh; ++kv_head) {
+        const size_t base_head = kv_head * ng;
+        const T *v_head_src = v_ptr + kv_head * hd;
+        const float *score_head = attn_score + base_head * qlen * kvlen;
+        T *out_head_dst = out_ptr + base_head * hd;
+
+        // Cast shared V(head) only once, then reuse across ng query heads.
+        const size_t v_count = kvlen * hd;
+        const int v_blocks = static_cast<int>((v_count + THREADS - 1) / THREADS);
+        cast_strided_lowp_to_float_kernel<<<v_blocks, THREADS, 0, stream>>>(
+            v_head_buf_f32, v_head_src, kvlen, hd, nkvh * hd);
+        LLAISYS_CUDA_CHECK(cudaGetLastError());
+
+        LLAISYS_CUBLAS_CHECK(cublasSgemmStridedBatched(
+            handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            m, n, k,
+            &alpha,
+            v_head_buf_f32, m, 0,
+            score_head, k, stride_b,
+            &beta,
+            out_head_buf_f32, m, stride_c,
+            static_cast<int>(ng)));
+
+        const size_t out_count = ng * qlen * hd;
+        const int out_blocks = static_cast<int>((out_count + THREADS - 1) / THREADS);
+        cast_float_group_to_strided_lowp_kernel<<<out_blocks, THREADS, 0, stream>>>(
+            out_head_dst, out_head_buf_f32, ng, qlen, hd, nh * hd, hd);
+        LLAISYS_CUDA_CHECK(cudaGetLastError());
     }
 }
 
@@ -216,28 +344,30 @@ void self_attention_impl(std::byte *attn_val, const std::byte *q,
     CHECK_ARGUMENT(nh <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
                    qlen <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
                    kvlen <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
-                   hd <= static_cast<size_t>(std::numeric_limits<int>::max()),
+                   hd <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
+                   nh * hd <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
+                   nkvh * hd <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
+                   nh * qlen <= static_cast<size_t>(std::numeric_limits<int>::max()),
                    "self_attention(nvidia): dims exceed int range required by cuBLAS");
+    CHECK_ARGUMENT(nkvh > 0 && nh > 0 && (nh % nkvh == 0),
+                   "self_attention(nvidia): require nh % nkvh == 0 and nh/nkvh > 0");
 
-    size_t score_count = nh * qlen * kvlen;
-    float *attn_score = nullptr;
-    T *q_head_buf = nullptr, *k_head_buf = nullptr, *v_head_buf = nullptr;
+    const size_t ng = nh / nkvh;
+    auto &runtime = llaisys::core::context().runtime();
+    auto &workspace = workspace_for_device(runtime.deviceId());
+    const size_t score_count = nh * qlen * kvlen;
+    ensure_workspace_buffer(workspace.attn_score, workspace.attn_score_capacity, score_count);
+
     float *v_head_buf_f32 = nullptr;
-    float *score_head_buf = nullptr;
     float *out_head_buf_f32 = nullptr;
-    T *out_head_buf = nullptr;
+    if constexpr (!std::is_same_v<T, float>) {
+        ensure_workspace_buffer(workspace.v_head_buf_f32, workspace.v_head_buf_capacity, kvlen * hd);
+        ensure_workspace_buffer(workspace.out_head_buf_f32, workspace.out_head_buf_capacity, ng * qlen * hd);
+        v_head_buf_f32 = workspace.v_head_buf_f32;
+        out_head_buf_f32 = workspace.out_head_buf_f32;
+    }
 
-    LLAISYS_CUDA_CHECK(cudaMalloc(&attn_score, score_count * sizeof(float)));
-    LLAISYS_CUDA_CHECK(cudaMalloc(&q_head_buf, qlen * hd * sizeof(T)));
-    LLAISYS_CUDA_CHECK(cudaMalloc(&k_head_buf, kvlen * hd * sizeof(T)));
-    LLAISYS_CUDA_CHECK(cudaMalloc(&v_head_buf, kvlen * hd * sizeof(T)));
-    LLAISYS_CUDA_CHECK(cudaMalloc(&v_head_buf_f32, kvlen * hd * sizeof(float)));
-    LLAISYS_CUDA_CHECK(cudaMalloc(&score_head_buf, qlen * kvlen * sizeof(float)));
-    LLAISYS_CUDA_CHECK(cudaMalloc(&out_head_buf_f32, qlen * hd * sizeof(float)));
-    LLAISYS_CUDA_CHECK(cudaMalloc(&out_head_buf, qlen * hd * sizeof(T)));
-
-    cublasHandle_t handle = nullptr;
-    LLAISYS_CUBLAS_CHECK(cublasCreate(&handle));
+    cublasHandle_t handle = cublas_handle_for_device(runtime.deviceId());
     LLAISYS_CUBLAS_CHECK(cublasSetStream(handle, stream));
 
     try {
@@ -245,47 +375,32 @@ void self_attention_impl(std::byte *attn_val, const std::byte *q,
         const T *k_ptr = reinterpret_cast<const T *>(k);
         const T *v_ptr = reinterpret_cast<const T *>(v);
         T *out_ptr = reinterpret_cast<T *>(attn_val);
-        size_t ng = nh / nkvh;
 
         // QK^T
-        compute_query_key(handle, attn_score, q_ptr, k_ptr,
-                      q_head_buf, k_head_buf,
+        compute_query_key(handle, workspace.attn_score, q_ptr, k_ptr,
                       qlen, kvlen, nh, nkvh, hd, ng, stream);
 
         // Scale + Causal Mask 
-        size_t total = nh * qlen * kvlen;
-        int blocks = (total + THREADS - 1) / THREADS;
+        const size_t total = nh * qlen * kvlen;
+        const int blocks = static_cast<int>((total + THREADS - 1) / THREADS);
         scale_causal_mask_kernel<<<blocks, THREADS, 0, stream>>>(
-            attn_score, qlen, kvlen, nh, scale);
+            workspace.attn_score, qlen, kvlen, nh, scale);
         LLAISYS_CUDA_CHECK(cudaGetLastError());
 
         // Softmax
-        size_t rows = nh * qlen;
+        const size_t rows = nh * qlen;
         softmax_rows_kernel<<<static_cast<int>(rows), THREADS, 0, stream>>>(
-            attn_score, rows, kvlen);
+            workspace.attn_score, rows, kvlen);
         LLAISYS_CUDA_CHECK(cudaGetLastError());
 
         // AV
-        compute_atteion_value(handle, out_ptr, attn_score, v_ptr,
-                      v_head_buf, v_head_buf_f32, score_head_buf, out_head_buf_f32, out_head_buf,
+        compute_atteion_value(handle, out_ptr, workspace.attn_score, v_ptr,
+                      v_head_buf_f32, out_head_buf_f32,
                       qlen, kvlen, nh, nkvh, hd, ng, stream);
 
     } catch (...) {
-        cublasDestroy(handle);
-        cudaFree(out_head_buf); cudaFree(out_head_buf_f32); cudaFree(score_head_buf); cudaFree(v_head_buf_f32); cudaFree(v_head_buf);
-        cudaFree(k_head_buf); cudaFree(q_head_buf); cudaFree(attn_score);
         throw;
     }
-
-    LLAISYS_CUBLAS_CHECK(cublasDestroy(handle));
-    LLAISYS_CUDA_CHECK(cudaFree(out_head_buf));
-    LLAISYS_CUDA_CHECK(cudaFree(out_head_buf_f32));
-    LLAISYS_CUDA_CHECK(cudaFree(score_head_buf));
-    LLAISYS_CUDA_CHECK(cudaFree(v_head_buf_f32));
-    LLAISYS_CUDA_CHECK(cudaFree(v_head_buf));
-    LLAISYS_CUDA_CHECK(cudaFree(k_head_buf));
-    LLAISYS_CUDA_CHECK(cudaFree(q_head_buf));
-    LLAISYS_CUDA_CHECK(cudaFree(attn_score));
 }
 
 namespace llaisys::ops::nvidia {
