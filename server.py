@@ -12,6 +12,7 @@ import json
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from enum import Enum
+from dataclasses import asdict
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -20,6 +21,16 @@ from huggingface_hub import snapshot_download
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
+
+# Import new session management and KV-Cache pool modules
+try:
+    from llaisys.session_manager import SessionManager, Message, Conversation
+    from llaisys.kv_cache_pool import KVCachePool
+    from llaisys.qwen2_with_cache import Qwen2WithKVCachePool
+    LLAISYS_MODULES_AVAILABLE = True
+except ImportError:
+    LLAISYS_MODULES_AVAILABLE = False
+    print("[Warning] llaisys session management modules not available")
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
@@ -98,6 +109,102 @@ class ChatCompletionStreamResponse(BaseModel):
 
 
 # ============================================================================
+# Session Management Models
+# ============================================================================
+
+class SessionMessage(BaseModel):
+    """Message in a session"""
+    role: str
+    content: str
+    token_ids: List[int] = Field(default_factory=list)
+    timestamp: float = Field(default_factory=time.time)
+
+
+class CreateSessionRequest(BaseModel):
+    """Request to create new session"""
+    title: Optional[str] = Field(default=None, description="Session title")
+
+
+class CreateSessionResponse(BaseModel):
+    """Response from session creation"""
+    session_id: str
+    title: str
+    created_at: float
+
+
+class ListSessionsResponse(BaseModel):
+    """Response for listing sessions"""
+    sessions: List[Dict[str, Any]]
+    total: int
+
+
+class GetMessagesResponse(BaseModel):
+    """Response for getting session messages"""
+    session_id: str
+    messages: List[Dict[str, Any]]
+
+
+class SendMessageRequest(BaseModel):
+    """Request to send message in session"""
+    content: str
+    max_tokens: int = Field(default=128, ge=1, le=4096)
+    temperature: float = Field(default=0.8, ge=0.0, le=2.0)
+    top_p: float = Field(default=0.8, ge=0.0, le=1.0)
+    top_k: int = Field(default=50, ge=0)
+    seed: int = Field(default=0, ge=0)
+    stream: bool = Field(default=False)
+
+
+class SendMessageResponse(BaseModel):
+    """Response from sending message"""
+    session_id: str
+    user_message: str
+    assistant_message: str
+    stats: Dict[str, Any]
+
+
+class UpdateMessageRequest(BaseModel):
+    """Request to update message"""
+    new_content: str
+    max_tokens: int = Field(default=128, ge=1, le=4096)
+    temperature: float = Field(default=0.8, ge=0.0, le=2.0)
+    top_p: float = Field(default=0.8, ge=0.0, le=1.0)
+    top_k: int = Field(default=50, ge=0)
+    seed: int = Field(default=0, ge=0)
+
+
+class UpdateMessageResponse(BaseModel):
+    """Response from updating message"""
+    session_id: str
+    message_index: int
+    assistant_message: str
+    stats: Dict[str, Any]
+
+
+class RegenerateRequest(BaseModel):
+    """Request to regenerate from a message"""
+    from_message_idx: int = Field(..., ge=0, description="Regenerate from this message index")
+    max_tokens: int = Field(default=128, ge=1, le=4096)
+    temperature: float = Field(default=0.8, ge=0.0, le=2.0)
+    top_p: float = Field(default=0.8, ge=0.0, le=1.0)
+    top_k: int = Field(default=50, ge=0)
+    seed: int = Field(default=0, ge=0)
+
+
+class RegenerateResponse(BaseModel):
+    """Response from regenerate"""
+    session_id: str
+    assistant_message: str
+    stats: Dict[str, Any]
+
+
+class CacheStatsResponse(BaseModel):
+    """Cache statistics"""
+    cache_stats: Dict[str, Any]
+    session_stats: Dict[str, Any]
+
+
+# ============================================================================
 # Model Management
 # ============================================================================
 
@@ -125,6 +232,16 @@ class ModelManager:
         self.model = None
         self.device_map = self._get_device_map()
         self.cached_token_ids = []
+        
+        # Initialize session management and KV-Cache pool
+        if LLAISYS_MODULES_AVAILABLE:
+            self.session_manager = SessionManager(max_sessions=100)
+            self.kv_cache_pool = KVCachePool(max_cache_entries=100)
+            self.qwen2_with_cache = None  # Will be initialized after model loading
+        else:
+            self.session_manager = None
+            self.kv_cache_pool = None
+            self.qwen2_with_cache = None
 
     def _get_device_map(self) -> str | dict:
         """Get appropriate device mapping for the model."""
@@ -169,6 +286,14 @@ class ModelManager:
             llaisys_device_type = get_llaisys_device(self.device)
             self.model = llaisys.models.Qwen2(model_path, llaisys_device_type)
             print("LLAISYS model loaded successfully")
+            
+            # Initialize Qwen2 with KV-Cache pool support
+            if LLAISYS_MODULES_AVAILABLE and self.session_manager and self.kv_cache_pool:
+                self.qwen2_with_cache = Qwen2WithKVCachePool(
+                    model_path, llaisys_device_type, self.session_manager, self.kv_cache_pool
+                )
+                self.qwen2_with_cache.tokenizer = self.tokenizer
+                print("Qwen2WithKVCachePool initialized successfully")
         else:
             raise ValueError(f"Unknown backend: {self.backend}")
 
@@ -523,6 +648,320 @@ def _build_prompt_from_messages(
     )
 
     return prompt
+
+
+# ============================================================================
+# Session Management API Endpoints
+# ============================================================================
+
+@app.post("/v1/sessions/create")
+async def create_session(request: CreateSessionRequest):
+    """Create a new conversation session"""
+    manager = get_model_manager()
+    if not manager.session_manager:
+        raise HTTPException(status_code=503, detail="Session management not available")
+    
+    session_id = manager.session_manager.create_session(title=request.title)
+    conv = manager.session_manager.get_session(session_id)
+    
+    return CreateSessionResponse(
+        session_id=session_id,
+        title=conv.title,
+        created_at=conv.created_at,
+    )
+
+
+@app.get("/v1/sessions")
+async def list_sessions():
+    """List all sessions"""
+    manager = get_model_manager()
+    if not manager.session_manager:
+        raise HTTPException(status_code=503, detail="Session management not available")
+    
+    sessions = manager.session_manager.list_sessions()
+    return ListSessionsResponse(sessions=sessions, total=len(sessions))
+
+
+@app.get("/v1/sessions/{session_id}/messages")
+async def get_session_messages(session_id: str):
+    """Get all messages in a session"""
+    manager = get_model_manager()
+    if not manager.session_manager:
+        raise HTTPException(status_code=503, detail="Session management not available")
+    
+    conv = manager.session_manager.get_session(session_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    messages = [asdict(msg) for msg in conv.messages]
+    return GetMessagesResponse(session_id=session_id, messages=messages)
+
+
+@app.post("/v1/sessions/{session_id}/message")
+async def send_message(session_id: str, request: SendMessageRequest):
+    """Send a message in a session and get AI response"""
+    manager = get_model_manager()
+    if not manager.session_manager:
+        raise HTTPException(status_code=503, detail="Session management not available")
+    
+    conv = manager.session_manager.get_session(session_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    if request.stream:
+        # Return streaming response
+        async def _stream_session_message():
+            from dataclasses import asdict as dataclass_asdict
+            
+            # Add user message
+            user_token_ids = manager.tokenizer.encode(request.content)
+            user_msg = Message(role="user", content=request.content, token_ids=user_token_ids)
+            manager.session_manager.add_message(session_id, user_msg)
+            
+            # Get full input token sequence
+            input_token_ids = conv.get_full_token_ids()
+            
+            # Generate tokens
+            completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+            created_time = int(time.time())
+            
+            assistant_content = ""
+            
+            if manager.qwen2_with_cache and manager.backend == "llaisys":
+                # Use KV-Cache pool for streaming
+                for token_text in manager.qwen2_with_cache.infer_streaming(
+                    input_token_ids, session_id,
+                    max_new_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                    top_k=request.top_k,
+                    top_p=request.top_p,
+                    seed=request.seed,
+                ):
+                    assistant_content += token_text
+                    chunk = ChatCompletionStreamResponse(
+                        id=completion_id,
+                        created=created_time,
+                        model="qwen-1.5b",
+                        choices=[ChatCompletionStreamChoice(
+                            index=0,
+                            delta={"content": token_text},
+                            finish_reason=None,
+                        )],
+                    )
+                    yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+            else:
+                # Fallback to standard generation
+                for token_text in manager.generate(
+                    prompt=_build_prompt_from_messages(manager, [ChatMessage(role=msg.role, content=msg.content) for msg in conv.messages] + [ChatMessage(role="user", content=request.content)]),
+                    max_new_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    top_k=request.top_k,
+                    seed=request.seed,
+                    stream=True,
+                ):
+                    assistant_content += token_text
+                    chunk = ChatCompletionStreamResponse(
+                        id=completion_id,
+                        created=created_time,
+                        model="qwen-1.5b",
+                        choices=[ChatCompletionStreamChoice(
+                            index=0,
+                            delta={"content": token_text},
+                            finish_reason=None,
+                        )],
+                    )
+                    yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+            
+            # Save assistant message
+            output_tokens = manager.tokenizer.encode(assistant_content)
+            assistant_msg = Message(role="assistant", content=assistant_content, token_ids=output_tokens)
+            manager.session_manager.add_message(session_id, assistant_msg)
+            
+            # Send final chunk
+            end_chunk = ChatCompletionStreamResponse(
+                id=completion_id,
+                created=created_time,
+                model="qwen-1.5b",
+                choices=[ChatCompletionStreamChoice(
+                    index=0,
+                    delta={},
+                    finish_reason="stop",
+                )],
+            )
+            yield f"data: {json.dumps(end_chunk.model_dump())}\n\n"
+            yield "data: [DONE]\n\n"
+        
+        return StreamingResponse(_stream_session_message(), media_type="text/event-stream")
+    else:
+        # Non-streaming response
+        if manager.qwen2_with_cache and manager.backend == "llaisys":
+            # Use KV-Cache pool
+            try:
+                assistant_message, stats = manager.qwen2_with_cache.chat_completion(
+                    session_id=session_id,
+                    user_message=request.content,
+                    max_new_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                    top_k=request.top_k,
+                    top_p=request.top_p,
+                    seed=request.seed,
+                )
+                stats["kv_cache_enabled"] = True
+            except Exception as e:
+                print(f"Error in chat_completion: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+        else:
+            # Fallback to standard generation
+            user_msg = Message(role="user", content=request.content, token_ids=manager.tokenizer.encode(request.content))
+            manager.session_manager.add_message(session_id, user_msg)
+            
+            prompt = _build_prompt_from_messages(manager, [ChatMessage(role=msg.role, content=msg.content) for msg in conv.messages + [user_msg]])
+            
+            assistant_message = manager.generate(
+                prompt=prompt,
+                max_new_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                top_k=request.top_k,
+                seed=request.seed,
+                stream=False,
+            )
+            
+            output_tokens = manager.tokenizer.encode(assistant_message)
+            assistant_msg = Message(role="assistant", content=assistant_message, token_ids=output_tokens)
+            manager.session_manager.add_message(session_id, assistant_msg)
+            
+            stats = {
+                "kv_cache_enabled": False,
+                "output_tokens": len(output_tokens),
+            }
+        
+        return SendMessageResponse(
+            session_id=session_id,
+            user_message=request.content,
+            assistant_message=assistant_message,
+            stats=stats,
+        )
+
+
+@app.put("/v1/sessions/{session_id}/message/{message_idx}")
+async def update_message(session_id: str, message_idx: int, request: UpdateMessageRequest):
+    """Update a message and regenerate from that point"""
+    manager = get_model_manager()
+    if not manager.session_manager:
+        raise HTTPException(status_code=503, detail="Session management not available")
+    
+    conv = manager.session_manager.get_session(session_id)
+    if not conv or message_idx >= len(conv.messages):
+        raise HTTPException(status_code=404, detail="Session or message not found")
+    
+    if manager.qwen2_with_cache and manager.backend == "llaisys":
+        # Use KV-Cache pool for regeneration
+        try:
+            assistant_message, stats = manager.qwen2_with_cache.update_and_regenerate(
+                session_id=session_id,
+                message_idx=message_idx,
+                new_content=request.new_content,
+                max_new_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_k=request.top_k,
+                top_p=request.top_p,
+                seed=request.seed,
+            )
+            stats["kv_cache_enabled"] = True
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    else:
+        raise HTTPException(status_code=503, detail="KV-Cache not available")
+    
+    return UpdateMessageResponse(
+        session_id=session_id,
+        message_index=message_idx,
+        assistant_message=assistant_message,
+        stats=stats,
+    )
+
+
+@app.post("/v1/sessions/{session_id}/regenerate")
+async def regenerate_from_message(session_id: str, request: RegenerateRequest):
+    """Regenerate response from a specific message"""
+    manager = get_model_manager()
+    if not manager.session_manager:
+        raise HTTPException(status_code=503, detail="Session management not available")
+    
+    conv = manager.session_manager.get_session(session_id)
+    if not conv or request.from_message_idx >= len(conv.messages):
+        raise HTTPException(status_code=404, detail="Session or message not found")
+    
+    if manager.qwen2_with_cache and manager.backend == "llaisys":
+        # Use KV-Cache pool
+        try:
+            assistant_message, stats = manager.qwen2_with_cache.regenerate_from_message(
+                session_id=session_id,
+                from_message_idx=request.from_message_idx,
+                max_new_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_k=request.top_k,
+                top_p=request.top_p,
+                seed=request.seed,
+            )
+            stats["kv_cache_enabled"] = True
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    else:
+        raise HTTPException(status_code=503, detail="KV-Cache not available")
+    
+    return RegenerateResponse(
+        session_id=session_id,
+        assistant_message=assistant_message,
+        stats=stats,
+    )
+
+
+@app.delete("/v1/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """Delete a session"""
+    manager = get_model_manager()
+    if not manager.session_manager:
+        raise HTTPException(status_code=503, detail="Session management not available")
+    
+    success = manager.session_manager.delete_session(session_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Clear KV-Cache for this session
+    if manager.kv_cache_pool:
+        manager.kv_cache_pool.invalidate_session_cache(session_id)
+    
+    return {"status": "success", "message": f"Session {session_id} deleted"}
+
+
+@app.get("/v1/debug/cache-stats")
+async def get_cache_stats():
+    """Get KV-Cache pool statistics"""
+    manager = get_model_manager()
+    if not manager.kv_cache_pool:
+        raise HTTPException(status_code=503, detail="KV-Cache not available")
+    
+    cache_stats = manager.kv_cache_pool.get_statistics()
+    session_stats = manager.session_manager.get_statistics() if manager.session_manager else {}
+    
+    return CacheStatsResponse(
+        cache_stats=cache_stats,
+        session_stats=session_stats,
+    )
+
+
+@app.post("/v1/debug/cache-clear")
+async def clear_cache():
+    """Clear all KV-Cache"""
+    manager = get_model_manager()
+    if not manager.kv_cache_pool:
+        raise HTTPException(status_code=503, detail="KV-Cache not available")
+    
+    count = manager.kv_cache_pool.clear_all()
+    return {"status": "success", "cleared_entries": count}
 
 
 # ============================================================================
