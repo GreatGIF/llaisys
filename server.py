@@ -124,6 +124,7 @@ class ModelManager:
         self.tokenizer = None
         self.model = None
         self.device_map = self._get_device_map()
+        self.cached_token_ids = []
 
     def _get_device_map(self) -> str | dict:
         """Get appropriate device mapping for the model."""
@@ -283,36 +284,59 @@ class ModelManager:
     def _generate_llaisys(
         self, prompt: str, max_new_tokens: int, temperature: float, top_p: float, top_k: int, seed: int, stream: bool
     ):
-        """Generate using LLAISYS backend."""
+        """Generate using LLAISYS backend with KV cache reuse."""
         # Encode prompt
         input_ids = self.tokenizer.encode(prompt)
+
+        # Check for KV cache prefix match
+        if self.cached_token_ids and len(input_ids) >= len(self.cached_token_ids) and \
+           input_ids[:len(self.cached_token_ids)] == self.cached_token_ids:
+            # Prefix matched, we can reuse KV cache
+            clear_kv_cache = False
+            # Only send the new tokens to the model
+            model_inputs = input_ids[len(self.cached_token_ids):]
+            print(f"KV cache matched. Reusing {len(self.cached_token_ids)} tokens, sending {len(model_inputs)} new tokens.")
+        else:
+            # No match or first request, reset cache
+            clear_kv_cache = True
+            model_inputs = input_ids
+            self.cached_token_ids = input_ids.copy()
+            print("KV cache not matched or first request. Clearing cache.")
 
         if stream:
             # True streaming: backend yields token ids as they are generated.
             def _token_generator():
                 for token_id in self.model.generate(
-                    input_ids,
+                    model_inputs,
                     max_new_tokens=max_new_tokens,
                     top_k=top_k,
                     top_p=top_p,
                     temperature=temperature,
                     seed=seed,
                     stream=True,
+                    clear_kv_cache=clear_kv_cache,
                 ):
+                    self.cached_token_ids.append(token_id)
                     token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
                     yield token_text
 
             return _token_generator()
         else:
             output_ids = self.model.generate(
-                input_ids,
+                model_inputs,
                 max_new_tokens=max_new_tokens,
                 top_k=top_k,
                 top_p=top_p,
                 temperature=temperature,
                 seed=seed,
                 stream=False,
+                clear_kv_cache=clear_kv_cache,
             )
+            # The output_ids includes the inputs we sent (model_inputs) + the new tokens.
+            # We want to extract only the generated tokens to append to our cache.
+            generated_ids = output_ids[len(model_inputs):]
+            self.cached_token_ids.extend(generated_ids)
+            
             full_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
             return full_text
 

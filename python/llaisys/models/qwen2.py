@@ -107,9 +107,11 @@ class Qwen2:
         top_p: float = 0.0,                 # 0 to disable
         seed: int = 0,
         stream: bool = False,
+        clear_kv_cache: bool = True,
     ):
-        # New request/session: clear backend decode cursor/KV-cache position.
-        LIB_LLAISYS.llaisysQwen2ModelReset(self._model)
+        if clear_kv_cache:
+            # New request/session: clear backend decode cursor/KV-cache position.
+            LIB_LLAISYS.llaisysQwen2ModelReset(self._model)
 
         from ..libllaisys.models import LlaisysQwen2SamplingParams
 
