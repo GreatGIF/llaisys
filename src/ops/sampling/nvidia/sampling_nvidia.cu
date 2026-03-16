@@ -9,281 +9,332 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
+#include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <mutex>
 
-__device__ __forceinline__ std::uint64_t splitmix64(std::uint64_t x) {
-	x += 0x9E3779B97F4A7C15ULL;
-	x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
-	x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
-	return x ^ (x >> 31);
+namespace {
+
+constexpr int kBlockSize = 256;
+
+std::mutex g_sampling_workspace_mutex;
+float *g_workspace_logits = nullptr;
+float *g_workspace_selected_logits = nullptr;
+int32_t *g_workspace_selected_indices = nullptr;
+size_t g_workspace_capacity = 0;
+
+void ensure_sampling_workspace(size_t n_elem) {
+	if (n_elem <= g_workspace_capacity) {
+		return;
+	}
+
+	if (g_workspace_logits != nullptr) {
+		LLAISYS_CUDA_CHECK(cudaFree(g_workspace_logits));
+		g_workspace_logits = nullptr;
+	}
+	if (g_workspace_selected_logits != nullptr) {
+		LLAISYS_CUDA_CHECK(cudaFree(g_workspace_selected_logits));
+		g_workspace_selected_logits = nullptr;
+	}
+	if (g_workspace_selected_indices != nullptr) {
+		LLAISYS_CUDA_CHECK(cudaFree(g_workspace_selected_indices));
+		g_workspace_selected_indices = nullptr;
+	}
+
+	LLAISYS_CUDA_CHECK(cudaMalloc(&g_workspace_logits, n_elem * sizeof(float)));
+	LLAISYS_CUDA_CHECK(cudaMalloc(&g_workspace_selected_logits, n_elem * sizeof(float)));
+	LLAISYS_CUDA_CHECK(cudaMalloc(&g_workspace_selected_indices, n_elem * sizeof(int32_t)));
+	g_workspace_capacity = n_elem;
 }
 
-__device__ __forceinline__ float uniform01(std::uint64_t seed, std::uint64_t batch_id) {
-	std::uint64_t x = seed;
-	if (x == 0ULL) {
-		x = static_cast<std::uint64_t>(clock64()) ^ (batch_id * 0x9E3779B97F4A7C15ULL);
-	}
-	const std::uint64_t r = splitmix64(x ^ (batch_id * 0xD1342543DE82EF95ULL));
-	const double u = static_cast<double>(r >> 11) * (1.0 / 9007199254740992.0);
-	return static_cast<float>(u);
+__device__ __forceinline__ uint64_t splitmix64_next(uint64_t &x) {
+	x += 0x9E3779B97F4A7C15ull;
+	uint64_t z = x;
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+	return z ^ (z >> 31);
 }
 
-template <typename T>
-__global__ void sampling_softmax_no_filter_kernel(std::int64_t *out, const T *logits,
-										 size_t batch_size, size_t vocab_size,
-										 float inv_temperature,
-										 std::uint64_t seed) {
-	const size_t b = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-	if (b >= batch_size) {
-		return;
-	}
-
-	const T *batch_logits = logits + b * vocab_size;
-
-	if (vocab_size == 0) {
-		out[b] = 0;
-		return;
-	}
-
-	float max_logit = llaisys::utils::cuda::to_float(batch_logits[0]) * inv_temperature;
-	std::int32_t argmax_idx = 0;
-	for (size_t i = 1; i < vocab_size; ++i) {
-		const float s = llaisys::utils::cuda::to_float(batch_logits[i]) * inv_temperature;
-		if (s > max_logit) {
-			max_logit = s;
-			argmax_idx = static_cast<std::int32_t>(i);
-		}
-	}
-
-	float total_prob = 0.0f;
-	for (size_t i = 0; i < vocab_size; ++i) {
-		const float s = llaisys::utils::cuda::to_float(batch_logits[i]) * inv_temperature;
-		total_prob += expf(s - max_logit);
-	}
-
-	if (total_prob <= 0.0f) {
-		out[b] = static_cast<std::int64_t>(argmax_idx);
-		return;
-	}
-
-	const float rand_val = uniform01(seed, static_cast<std::uint64_t>(b));
-	float cumulative = 0.0f;
-	std::int32_t sampled_idx = static_cast<std::int32_t>(vocab_size - 1);
-
-	for (size_t i = 0; i < vocab_size; ++i) {
-		const float s = llaisys::utils::cuda::to_float(batch_logits[i]) * inv_temperature;
-		const float p = expf(s - max_logit) / total_prob;
-		cumulative += p;
-		if (rand_val <= cumulative) {
-			sampled_idx = static_cast<std::int32_t>(i);
-			break;
-		}
-	}
-
-	out[b] = static_cast<std::int64_t>(sampled_idx);
+__device__ __forceinline__ float uniform01(uint64_t &state) {
+	// Use top 24 bits to build a float in [0, 1).
+	constexpr float inv_2pow24 = 1.0f / 16777216.0f;
+	return static_cast<float>(splitmix64_next(state) >> 40) * inv_2pow24;
 }
 
 template <typename T>
-__global__ void sampling_full_gpu_kernel(std::int64_t *out, const T *logits,
-									 float *scores_workspace,
-									 std::int32_t *indices_workspace,
-									 float *probs_workspace,
-									 size_t batch_size, size_t vocab_size,
-									 float inv_temperature,
-									 std::int32_t k_size, float top_p,
-									 std::uint64_t seed) {
-	const size_t b = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-	if (b >= batch_size) {
+__global__ void sampling_kernel(std::int64_t *out, const T *logits, float *workspace_logits,
+								float *workspace_selected_logits, int32_t *workspace_selected_indices,
+								size_t vocab_size, float temperature,
+								int32_t top_k, float top_p, uint64_t seed) {
+	const size_t b = static_cast<size_t>(blockIdx.x);
+	const int tid = static_cast<int>(threadIdx.x);
+
+	float *row_logits = workspace_logits + b * vocab_size;
+	float *row_selected_logits = workspace_selected_logits + b * vocab_size;
+	int32_t *row_selected_indices = workspace_selected_indices + b * vocab_size;
+	const T *batch_logits = logits + b * vocab_size;
+
+	__shared__ float s_values[kBlockSize];
+	__shared__ int32_t s_indices[kBlockSize];
+	__shared__ float s_max_logit;
+	__shared__ float s_total_exp_all;
+	__shared__ int32_t s_selected_count;
+	__shared__ float s_total_ref;
+
+	// 1) temperature scaling to workspace
+	for (size_t i = static_cast<size_t>(tid); i < vocab_size; i += blockDim.x) {
+		row_logits[i] = llaisys::utils::cuda::to_float(batch_logits[i]) / temperature;
+	}
+	__syncthreads();
+
+	// reduce max logit
+	float local_max = -FLT_MAX;
+	for (size_t i = static_cast<size_t>(tid); i < vocab_size; i += blockDim.x) {
+		local_max = fmaxf(local_max, row_logits[i]);
+	}
+	s_values[tid] = local_max;
+	__syncthreads();
+	for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+		if (tid < stride) {
+			s_values[tid] = fmaxf(s_values[tid], s_values[tid + stride]);
+		}
+		__syncthreads();
+	}
+	if (tid == 0) {
+		s_max_logit = s_values[0];
+		s_selected_count = 0;
+		s_total_ref = 0.0f;
+	}
+	__syncthreads();
+
+	const bool use_top_p = (top_p > 0.0f && top_p < 1.0f);
+	const bool use_top_k = (top_k > 0);
+
+	// Fast path: no top-k and no top-p => full-vocab multinomial
+	if (!use_top_k && !use_top_p) {
+		float local_sum = 0.0f;
+		for (size_t i = static_cast<size_t>(tid); i < vocab_size; i += blockDim.x) {
+			local_sum += expf(row_logits[i] - s_max_logit);
+		}
+		s_values[tid] = local_sum;
+		__syncthreads();
+		for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+			if (tid < stride) {
+				s_values[tid] += s_values[tid + stride];
+			}
+			__syncthreads();
+		}
+
+		if (tid == 0) {
+			const float total = fmaxf(s_values[0], 1e-12f);
+			uint64_t rng_state = seed != 0
+				? (seed ^ (0xD1B54A32D192ED03ull + static_cast<uint64_t>(b) * 0x9E3779B97F4A7C15ull))
+				: (static_cast<uint64_t>(clock64()) ^
+				(0xA24BAED4963EE407ull + static_cast<uint64_t>(b) * 0x9E3779B97F4A7C15ull));
+
+			const float u = uniform01(rng_state) * total;
+			float cumulative = 0.0f;
+			int32_t sampled = 0;
+			for (size_t i = 0; i < vocab_size; ++i) {
+				cumulative += expf(row_logits[i] - s_max_logit);
+				if (u <= cumulative || i == vocab_size - 1) {
+					sampled = static_cast<int32_t>(i);
+					break;
+				}
+			}
+			out[b] = static_cast<std::int64_t>(sampled);
+		}
 		return;
 	}
 
-	float *scores = scores_workspace + b * vocab_size;
-	std::int32_t *indices = indices_workspace + b * vocab_size;
-	float *probs = probs_workspace + b * static_cast<size_t>(k_size);
-	const T *batch_logits = logits + b * vocab_size;
-
-	for (size_t i = 0; i < vocab_size; ++i) {
-		scores[i] = llaisys::utils::cuda::to_float(batch_logits[i]) * inv_temperature;
-		indices[i] = static_cast<std::int32_t>(i);
+	// If top-p is enabled without top-k, we need all-vocab total mass as reference.
+	if (!use_top_k && use_top_p) {
+		float local_sum = 0.0f;
+		for (size_t i = static_cast<size_t>(tid); i < vocab_size; i += blockDim.x) {
+			local_sum += expf(row_logits[i] - s_max_logit);
+		}
+		s_values[tid] = local_sum;
+		__syncthreads();
+		for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+			if (tid < stride) {
+				s_values[tid] += s_values[tid + stride];
+			}
+			__syncthreads();
+		}
+		if (tid == 0) {
+			s_total_exp_all = fmaxf(s_values[0], 1e-12f);
+		}
+		__syncthreads();
 	}
 
-	// Partial selection sort: keep the first k_size entries as sorted top-k.
-	for (std::int32_t i = 0; i < k_size; ++i) {
-		std::int32_t best = i;
-		for (std::int32_t j = i + 1; j < static_cast<std::int32_t>(vocab_size); ++j) {
-			if (scores[j] > scores[best]) {
-				best = j;
+	// Iterative parallel top-1 extraction (used for top-k, and top-p without top-k)
+	int32_t k_limit = static_cast<int32_t>(vocab_size);
+	if (use_top_k) {
+		k_limit = min(static_cast<int32_t>(vocab_size), max(top_k, 1));
+	}
+
+	for (int32_t it = 0; it < k_limit; ++it) {
+		float local_best = -FLT_MAX;
+		int32_t local_idx = -1;
+		for (size_t i = static_cast<size_t>(tid); i < vocab_size; i += blockDim.x) {
+			const float v = row_logits[i];
+			if (v > local_best || (v == local_best && static_cast<int32_t>(i) < local_idx)) {
+				local_best = v;
+				local_idx = static_cast<int32_t>(i);
 			}
 		}
-		if (best != i) {
-			const float tmp_score = scores[i];
-			scores[i] = scores[best];
-			scores[best] = tmp_score;
 
-			const std::int32_t tmp_idx = indices[i];
-			indices[i] = indices[best];
-			indices[best] = tmp_idx;
+		s_values[tid] = local_best;
+		s_indices[tid] = local_idx;
+		__syncthreads();
+
+		for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+			if (tid < stride) {
+				const float v0 = s_values[tid];
+				const float v1 = s_values[tid + stride];
+				const int32_t i0 = s_indices[tid];
+				const int32_t i1 = s_indices[tid + stride];
+				if (v1 > v0 || (v1 == v0 && i1 < i0)) {
+					s_values[tid] = v1;
+					s_indices[tid] = i1;
+				}
+			}
+			__syncthreads();
 		}
+
+		if (tid == 0) {
+			const int32_t best_idx = s_indices[0];
+			const float best_val = s_values[0];
+			if (best_idx < 0 || best_val <= -FLT_MAX / 2.0f) {
+				break;
+			}
+
+			row_selected_indices[it] = best_idx;
+			row_selected_logits[it] = best_val;
+			row_logits[best_idx] = -FLT_MAX;
+			s_selected_count = it + 1;
+
+			if (!use_top_k && use_top_p) {
+				// Early stop for pure top-p: cumulative over sorted values against all-vocab mass.
+				s_total_ref += expf(best_val - s_max_logit);
+				if (s_total_ref >= top_p * s_total_exp_all) {
+					break;
+				}
+			}
+		}
+		__syncthreads();
 	}
 
-	const float max_logit = scores[0];
-	float total_prob = 0.0f;
+	if (tid == 0) {
+		const int32_t n_sel = max(s_selected_count, 1);
 
-	for (std::int32_t i = 0; i < k_size; ++i) {
-		const float e = expf(scores[i] - max_logit);
-		probs[i] = e;
-		total_prob += e;
-	}
+		// Reference normalization mass.
+		float ref_mass = 0.0f;
+		if (use_top_k) {
+			for (int32_t i = 0; i < n_sel; ++i) {
+				ref_mass += expf(row_selected_logits[i] - s_max_logit);
+			}
+		} else {
+			// pure top-p path
+			ref_mass = s_total_exp_all;
+		}
+		ref_mass = fmaxf(ref_mass, 1e-12f);
 
-	if (total_prob <= 0.0f) {
-		out[b] = static_cast<std::int64_t>(indices[0]);
-		return;
-	}
+		int32_t p_size = n_sel;
+		if (use_top_p) {
+			float cumulative = 0.0f;
+			p_size = 0;
+			for (int32_t i = 0; i < n_sel; ++i) {
+				cumulative += expf(row_selected_logits[i] - s_max_logit) / ref_mass;
+				p_size = i + 1;
+				if (cumulative >= top_p) {
+					break;
+				}
+			}
+			p_size = max(p_size, 1);
+		}
 
-	for (std::int32_t i = 0; i < k_size; ++i) {
-		probs[i] /= total_prob;
-	}
+		float sample_mass = 0.0f;
+		for (int32_t i = 0; i < p_size; ++i) {
+			sample_mass += expf(row_selected_logits[i] - s_max_logit);
+		}
+		sample_mass = fmaxf(sample_mass, 1e-12f);
 
-	std::int32_t p_size = k_size;
-	if (top_p > 0.0f && top_p < 1.0f) {
-		float cumulative_prob = 0.0f;
-		p_size = 0;
-		for (std::int32_t i = 0; i < k_size; ++i) {
-			cumulative_prob += probs[i];
-			p_size = i + 1;
-			if (cumulative_prob >= top_p) {
+		uint64_t rng_state = seed != 0
+			? (seed ^ (0xD1B54A32D192ED03ull + static_cast<uint64_t>(b) * 0x9E3779B97F4A7C15ull))
+			: (static_cast<uint64_t>(clock64()) ^
+			   (0xA24BAED4963EE407ull + static_cast<uint64_t>(b) * 0x9E3779B97F4A7C15ull));
+
+		const float u = uniform01(rng_state) * sample_mass;
+		float cumulative = 0.0f;
+		int32_t sampled_slot = 0;
+		for (int32_t i = 0; i < p_size; ++i) {
+			cumulative += expf(row_selected_logits[i] - s_max_logit);
+			if (u <= cumulative || i == p_size - 1) {
+				sampled_slot = i;
 				break;
 			}
 		}
 
-		total_prob = 0.0f;
-		for (std::int32_t i = 0; i < p_size; ++i) {
-			total_prob += probs[i];
-		}
-
-		if (total_prob > 0.0f) {
-			for (std::int32_t i = 0; i < p_size; ++i) {
-				probs[i] /= total_prob;
-			}
-		}
+		out[b] = static_cast<std::int64_t>(row_selected_indices[sampled_slot]);
 	}
-
-	const float rand_val = uniform01(seed, static_cast<std::uint64_t>(b));
-	float cumulative = 0.0f;
-	std::int32_t sampled_idx = p_size - 1;
-
-	for (std::int32_t i = 0; i < p_size; ++i) {
-		cumulative += probs[i];
-		if (rand_val <= cumulative) {
-			sampled_idx = i;
-			break;
-		}
-	}
-
-	out[b] = static_cast<std::int64_t>(indices[sampled_idx]);
 }
+
+} // namespace
 
 namespace llaisys::ops::nvidia {
 
 void sampling(std::byte *out, const std::byte *logits, llaisysDataType_t type,
 			  size_t batch_size, size_t vocab_size, float temperature,
 			  int32_t top_k, float top_p, uint64_t seed) {
-	// Keep parameter behavior consistent with CPU implementation.
+	if (batch_size == 0 || vocab_size == 0) {
+		return;
+	}
+
 	temperature = std::max(temperature, 1e-6f);
 	top_p = std::max(0.0f, std::min(top_p, 1.0f));
-	const float inv_temperature = 1.0f / temperature;
 
-	constexpr int threads_per_block = 128;
-	const int sample_blocks = static_cast<int>((batch_size + threads_per_block - 1) / threads_per_block);
+	const size_t n_elem = batch_size * vocab_size;
 
-	// Fast path: no top-k / top-p filtering required.
-	// This avoids O(V^2) selection sort and large temporary allocations.
-	const bool no_top_k = (top_k <= 0 || top_k >= static_cast<std::int32_t>(vocab_size));
-	const bool no_top_p = !(top_p > 0.0f && top_p < 1.0f);
-	if (no_top_k && no_top_p) {
-		switch (type) {
-		case LLAISYS_DTYPE_F32:
-			sampling_softmax_no_filter_kernel<<<sample_blocks, threads_per_block>>>(
-				reinterpret_cast<std::int64_t *>(out), reinterpret_cast<const float *>(logits),
-				batch_size, vocab_size, inv_temperature, seed);
-			LLAISYS_CUDA_CHECK(cudaGetLastError());
-			return;
-		case LLAISYS_DTYPE_BF16:
-			sampling_softmax_no_filter_kernel<<<sample_blocks, threads_per_block>>>(
-				reinterpret_cast<std::int64_t *>(out), reinterpret_cast<const nv_bfloat16 *>(logits),
-				batch_size, vocab_size, inv_temperature, seed);
-			LLAISYS_CUDA_CHECK(cudaGetLastError());
-			return;
-		case LLAISYS_DTYPE_F16:
-			sampling_softmax_no_filter_kernel<<<sample_blocks, threads_per_block>>>(
-				reinterpret_cast<std::int64_t *>(out), reinterpret_cast<const half *>(logits),
-				batch_size, vocab_size, inv_temperature, seed);
-			LLAISYS_CUDA_CHECK(cudaGetLastError());
-			return;
-		default:
-			EXCEPTION_UNSUPPORTED_DATATYPE(type);
-		}
-	}
+	std::lock_guard<std::mutex> lock(g_sampling_workspace_mutex);
+	ensure_sampling_workspace(n_elem);
 
-	const size_t total_size = batch_size * vocab_size;
-
-	std::int32_t k_size = static_cast<std::int32_t>(vocab_size);
-	if (top_k > 0 && top_k < static_cast<std::int32_t>(vocab_size)) {
-		k_size = top_k;
-	}
-
-	float *d_scores = nullptr;
-	std::int32_t *d_indices = nullptr;
-	float *d_probs_workspace = nullptr;
-
-	LLAISYS_CUDA_CHECK(cudaMalloc(&d_scores, total_size * sizeof(float)));
-	LLAISYS_CUDA_CHECK(cudaMalloc(&d_indices, total_size * sizeof(std::int32_t)));
-	LLAISYS_CUDA_CHECK(cudaMalloc(&d_probs_workspace, batch_size * static_cast<size_t>(k_size) * sizeof(float)));
-
-	auto cleanup = [&]() {
-		if (d_probs_workspace != nullptr) {
-			LLAISYS_CUDA_CHECK(cudaFree(d_probs_workspace));
-			d_probs_workspace = nullptr;
-		}
-		if (d_indices != nullptr) {
-			LLAISYS_CUDA_CHECK(cudaFree(d_indices));
-			d_indices = nullptr;
-		}
-		if (d_scores != nullptr) {
-			LLAISYS_CUDA_CHECK(cudaFree(d_scores));
-			d_scores = nullptr;
-		}
-	};
+	dim3 grid(static_cast<unsigned int>(batch_size));
+	dim3 block(kBlockSize);
 
 	switch (type) {
 	case LLAISYS_DTYPE_F32:
-		sampling_full_gpu_kernel<<<sample_blocks, threads_per_block>>>(
-			reinterpret_cast<std::int64_t *>(out), reinterpret_cast<const float *>(logits),
-			d_scores, d_indices, d_probs_workspace,
-			batch_size, vocab_size, inv_temperature, k_size, top_p, seed);
-		LLAISYS_CUDA_CHECK(cudaGetLastError());
+		sampling_kernel<<<grid, block>>>(reinterpret_cast<std::int64_t *>(out),
+										 reinterpret_cast<const float *>(logits),
+										 g_workspace_logits,
+										 g_workspace_selected_logits,
+										 g_workspace_selected_indices,
+										 vocab_size, temperature, top_k, top_p, seed);
 		break;
 	case LLAISYS_DTYPE_BF16:
-		sampling_full_gpu_kernel<<<sample_blocks, threads_per_block>>>(
-			reinterpret_cast<std::int64_t *>(out), reinterpret_cast<const nv_bfloat16 *>(logits),
-			d_scores, d_indices, d_probs_workspace,
-			batch_size, vocab_size, inv_temperature, k_size, top_p, seed);
-		LLAISYS_CUDA_CHECK(cudaGetLastError());
+		sampling_kernel<<<grid, block>>>(reinterpret_cast<std::int64_t *>(out),
+										 reinterpret_cast<const nv_bfloat16 *>(logits),
+										 g_workspace_logits,
+										 g_workspace_selected_logits,
+										 g_workspace_selected_indices,
+										 vocab_size, temperature, top_k, top_p, seed);
 		break;
 	case LLAISYS_DTYPE_F16:
-		sampling_full_gpu_kernel<<<sample_blocks, threads_per_block>>>(
-			reinterpret_cast<std::int64_t *>(out), reinterpret_cast<const half *>(logits),
-			d_scores, d_indices, d_probs_workspace,
-			batch_size, vocab_size, inv_temperature, k_size, top_p, seed);
-		LLAISYS_CUDA_CHECK(cudaGetLastError());
+		sampling_kernel<<<grid, block>>>(reinterpret_cast<std::int64_t *>(out),
+										 reinterpret_cast<const half *>(logits),
+										 g_workspace_logits,
+										 g_workspace_selected_logits,
+										 g_workspace_selected_indices,
+										 vocab_size, temperature, top_k, top_p, seed);
 		break;
 	default:
-		cleanup();
 		EXCEPTION_UNSUPPORTED_DATATYPE(type);
 	}
 
-	cleanup();
+	LLAISYS_CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace llaisys::ops::nvidia
+
