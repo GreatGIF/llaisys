@@ -38,6 +38,19 @@ size_t Qwen2DynamicBatchEngine::addRequest(const std::vector<int64_t> &prompt_to
 }
 
 std::vector<Qwen2FinishedSequence> Qwen2DynamicBatchEngine::step() {
+    std::vector<Qwen2FinishedSequence> finished;
+    for (const auto &event : stepEvents()) {
+        if (event.is_finished) {
+            finished.push_back(Qwen2FinishedSequence{
+                event.seq_id,
+                event.completion_token_ids,
+            });
+        }
+    }
+    return finished;
+}
+
+std::vector<Qwen2StepEvent> Qwen2DynamicBatchEngine::stepEvents() {
     if (_scheduler.isFinished()) {
         return {};
     }
@@ -55,17 +68,21 @@ std::vector<Qwen2FinishedSequence> Qwen2DynamicBatchEngine::step() {
     const auto outputs = _model.runBatch(_runtime_state, scheduled.scheduled, scheduled.is_prefill, params);
     _scheduler.postprocess(scheduled.scheduled, outputs);
 
-    std::vector<Qwen2FinishedSequence> finished;
-    for (const auto &entry : scheduled.scheduled) {
-        if (entry->isFinished()) {
-            finished.push_back(Qwen2FinishedSequence{
-                entry->sequence->seqId(),
-                entry->sequence->completionTokenIds(),
-            });
+    std::vector<Qwen2StepEvent> events;
+    events.reserve(scheduled.scheduled.size());
+    for (size_t i = 0; i < scheduled.scheduled.size(); ++i) {
+        const auto &entry = scheduled.scheduled[i];
+        Qwen2StepEvent event;
+        event.seq_id = entry->sequence->seqId();
+        event.token_id = outputs[i];
+        event.is_finished = entry->isFinished();
+        if (event.is_finished) {
+            event.completion_token_ids = entry->sequence->completionTokenIds();
             _sampling_params.erase(entry->sequence->seqId());
         }
+        events.push_back(std::move(event));
     }
-    return finished;
+    return events;
 }
 
 bool Qwen2DynamicBatchEngine::isFinished() const {

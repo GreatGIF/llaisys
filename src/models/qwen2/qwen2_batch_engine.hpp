@@ -14,6 +14,13 @@ struct Qwen2FinishedSequence {
     std::vector<int64_t> completion_token_ids;
 };
 
+struct Qwen2StepEvent {
+    size_t seq_id = 0;
+    int64_t token_id = 0;
+    bool is_finished = false;
+    std::vector<int64_t> completion_token_ids;
+};
+
 class Qwen2DynamicBatchEngine {
 public:
     Qwen2DynamicBatchEngine(const LlaisysQwen2Meta &meta,
@@ -28,6 +35,7 @@ public:
                       size_t max_completion_tokens,
                       const LlaisysQwen2SamplingParams &sampling_params,
                       bool ignore_eos = false);
+    std::vector<Qwen2StepEvent> stepEvents();
     std::vector<Qwen2FinishedSequence> step();
     bool isFinished() const;
     Qwen2Model &model();

@@ -36,9 +36,21 @@ class FakeBatchEngine:
         self.step_batch_sizes.append(len(batch))
         return [{"seq_id": seq_id, "token_ids": [inputs[-1] + 1]} for seq_id, inputs in batch]
 
+    def step_events(self):
+        finished = self.step()
+        return [
+            {
+                "seq_id": item["seq_id"],
+                "token_id": item["token_ids"][-1],
+                "is_finished": True,
+                "completion_token_ids": item["token_ids"],
+            }
+            for item in finished
+        ]
+
 
 class FailingBatchEngine(FakeBatchEngine):
-    def step(self):
+    def step_events(self):
         raise RuntimeError("boom")
 
 
@@ -156,5 +168,27 @@ def test_model_manager_dynamic_batch_propagates_worker_errors():
             assert False, "expected runtime error"
         except RuntimeError as exc:
             assert "dynamic batch request failed" in str(exc)
+    finally:
+        manager.shutdown()
+
+
+def test_model_manager_dynamic_batch_stream_path():
+    manager = ModelManager(backend="llaisys")
+    manager.tokenizer = FakeTokenizer()
+    manager.llaisys_use_dynamic_batch = True
+    fake_engine = FakeBatchEngine()
+    manager.llaisys_batch_engine = fake_engine
+    manager._llaisys_worker = threading.Thread(target=manager._llaisys_batch_loop, daemon=True)
+    manager._llaisys_worker.start()
+    try:
+        tokens = list(manager._generate_llaisys_dynamic_batch_stream(
+            prompt="ab",
+            max_new_tokens=1,
+            temperature=1.0,
+            top_p=0.0,
+            top_k=1,
+            seed=1,
+        ))
+        assert tokens == ["c"]
     finally:
         manager.shutdown()

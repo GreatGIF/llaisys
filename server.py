@@ -4,14 +4,13 @@ Supports both streaming and non-streaming modes.
 """
 
 import os
-import sys
 import io
+import sys
 import time
 import uuid
 import json
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-from enum import Enum
 from threading import Lock, Thread
 from queue import Queue, Empty
 from dataclasses import dataclass
@@ -22,7 +21,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from huggingface_hub import snapshot_download
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 # ============================================================================
@@ -239,11 +238,19 @@ class ModelManager:
                 if self.llaisys_batch_engine.is_finished():
                     continue
 
-                finished = self.llaisys_batch_engine.step()
-                for item in finished:
-                    req = self._llaisys_pending.pop(item["seq_id"], None)
-                    if req is not None:
-                        req.result_queue.put(("ok", item["token_ids"]))
+                events = self.llaisys_batch_engine.step_events()
+                for item in events:
+                    req = self._llaisys_pending.get(item["seq_id"])
+                    if req is None:
+                        continue
+                    if req.stream:
+                        req.result_queue.put(("token", item["token_id"]))
+                    if item["is_finished"]:
+                        self._llaisys_pending.pop(item["seq_id"], None)
+                        if req.stream:
+                            req.result_queue.put(("done", item["completion_token_ids"]))
+                        else:
+                            req.result_queue.put(("ok", item["completion_token_ids"]))
             except Exception as exc:
                 for request in collected:
                     request.result_queue.put(("error", exc))
@@ -361,7 +368,11 @@ class ModelManager:
         self, prompt: str, max_new_tokens: int, temperature: float, top_p: float, top_k: int, seed: int, stream: bool
     ):
         """Generate using LLAISYS backend with KV cache reuse."""
-        if self.llaisys_use_dynamic_batch and not stream:
+        if self.llaisys_use_dynamic_batch:
+            if stream:
+                return self._generate_llaisys_dynamic_batch_stream(
+                    prompt, max_new_tokens, temperature, top_p, top_k, seed
+                )
             return self._generate_llaisys_dynamic_batch(
                 prompt, max_new_tokens, temperature, top_p, top_k, seed
             )
@@ -434,6 +445,7 @@ class ModelManager:
             top_p=top_p,
             seed=seed,
             ignore_eos=False,
+            stream=False,
             result_queue=result_queue,
         ))
         status, payload = result_queue.get(timeout=self._llaisys_request_timeout_s)
@@ -441,6 +453,35 @@ class ModelManager:
             raise RuntimeError(f"LLAISYS dynamic batch request failed: {payload}") from payload
         token_ids = payload
         return self.tokenizer.decode(input_ids + token_ids, skip_special_tokens=True)
+
+    def _generate_llaisys_dynamic_batch_stream(
+        self, prompt: str, max_new_tokens: int, temperature: float, top_p: float, top_k: int, seed: int
+    ):
+        input_ids = self.tokenizer.encode(prompt)
+        result_queue = Queue()
+        self._llaisys_request_queue.put(_BatchRequest(
+            input_ids=list(input_ids),
+            max_completion_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            seed=seed,
+            ignore_eos=False,
+            stream=True,
+            result_queue=result_queue,
+        ))
+
+        def _token_generator():
+            while True:
+                status, payload = result_queue.get(timeout=self._llaisys_request_timeout_s)
+                if status == "error":
+                    raise RuntimeError(f"LLAISYS dynamic batch request failed: {payload}") from payload
+                if status == "token":
+                    yield self.tokenizer.decode([payload], skip_special_tokens=True)
+                elif status == "done":
+                    break
+
+        return _token_generator()
 
 
 @dataclass
@@ -452,6 +493,7 @@ class _BatchRequest:
     top_p: float
     seed: int
     ignore_eos: bool
+    stream: bool
     result_queue: Queue
 
 

@@ -112,6 +112,27 @@ __C {
         return result;
     }
 
+    struct LlaisysQwen2StepEventsResult *llaisysQwen2DynamicBatchEngineStepEvents(struct LlaisysQwen2DynamicBatchEngine *engine) {
+        auto events = engine->impl->stepEvents();
+        auto *result = new LlaisysQwen2StepEventsResult{};
+        result->nevent = events.size();
+        result->events = events.empty() ? nullptr : new LlaisysQwen2StepEvent[events.size()];
+        for (size_t i = 0; i < events.size(); ++i) {
+            result->events[i].seq_id = events[i].seq_id;
+            result->events[i].token_id = events[i].token_id;
+            result->events[i].is_finished = static_cast<uint8_t>(events[i].is_finished);
+            result->events[i].ncompletion_token = events[i].completion_token_ids.size();
+            if (events[i].completion_token_ids.empty()) {
+                result->events[i].completion_token_ids = nullptr;
+            } else {
+                result->events[i].completion_token_ids = new int64_t[events[i].completion_token_ids.size()];
+                std::copy(events[i].completion_token_ids.begin(), events[i].completion_token_ids.end(),
+                          result->events[i].completion_token_ids);
+            }
+        }
+        return result;
+    }
+
     void llaisysQwen2StepResultDestroy(struct LlaisysQwen2StepResult *result) {
         if (result == nullptr) {
             return;
@@ -120,6 +141,17 @@ __C {
             delete[] result->sequences[i].token_ids;
         }
         delete[] result->sequences;
+        delete result;
+    }
+
+    void llaisysQwen2StepEventsResultDestroy(struct LlaisysQwen2StepEventsResult *result) {
+        if (result == nullptr) {
+            return;
+        }
+        for (size_t i = 0; i < result->nevent; ++i) {
+            delete[] result->events[i].completion_token_ids;
+        }
+        delete[] result->events;
         delete result;
     }
 

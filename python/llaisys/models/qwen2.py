@@ -285,5 +285,23 @@ class Qwen2DynamicBatchEngine:
         finally:
             LIB_LLAISYS.llaisysQwen2StepResultDestroy(result)
 
+    def step_events(self):
+        result = LIB_LLAISYS.llaisysQwen2DynamicBatchEngineStepEvents(self._engine)
+        try:
+            outputs = []
+            n = result.contents.nevent
+            for i in range(n):
+                event = result.contents.events[i]
+                completion = [event.completion_token_ids[j] for j in range(event.ncompletion_token)]
+                outputs.append({
+                    "seq_id": int(event.seq_id),
+                    "token_id": int(event.token_id),
+                    "is_finished": bool(event.is_finished),
+                    "completion_token_ids": completion,
+                })
+            return outputs
+        finally:
+            LIB_LLAISYS.llaisysQwen2StepEventsResultDestroy(result)
+
     def is_finished(self) -> bool:
         return bool(LIB_LLAISYS.llaisysQwen2DynamicBatchEngineIsFinished(self._engine))

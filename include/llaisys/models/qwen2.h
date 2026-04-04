@@ -47,9 +47,22 @@ __C {
         size_t ntoken;
     };
 
+    struct LlaisysQwen2StepEvent {
+        size_t seq_id;
+        int64_t token_id;
+        uint8_t is_finished;
+        int64_t *completion_token_ids;
+        size_t ncompletion_token;
+    };
+
     struct LlaisysQwen2StepResult {
         struct LlaisysQwen2FinishedSequence *sequences;
         size_t nsequence;
+    };
+
+    struct LlaisysQwen2StepEventsResult {
+        struct LlaisysQwen2StepEvent *events;
+        size_t nevent;
     };
 
     __export struct LlaisysQwen2Model *llaisysQwen2ModelCreate(const LlaisysQwen2Meta *meta, llaisysDeviceType_t device, int *device_ids, int ndevice);
@@ -79,6 +92,8 @@ __C {
         size_t max_completion_tokens, const struct LlaisysQwen2SamplingParams *sampling_params, uint8_t ignore_eos);
     __export struct LlaisysQwen2StepResult *llaisysQwen2DynamicBatchEngineStep(struct LlaisysQwen2DynamicBatchEngine *engine);
     __export void llaisysQwen2StepResultDestroy(struct LlaisysQwen2StepResult *result);
+    __export struct LlaisysQwen2StepEventsResult *llaisysQwen2DynamicBatchEngineStepEvents(struct LlaisysQwen2DynamicBatchEngine *engine);
+    __export void llaisysQwen2StepEventsResultDestroy(struct LlaisysQwen2StepEventsResult *result);
     __export uint8_t llaisysQwen2DynamicBatchEngineIsFinished(struct LlaisysQwen2DynamicBatchEngine *engine);
 }
 #endif // LLAISYS_MODELS_QWEN2_H

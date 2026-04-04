@@ -62,6 +62,21 @@ class LlaisysQwen2StepResult(ctypes.Structure):
         ("nsequence", ctypes.c_size_t),
     ]
 
+class LlaisysQwen2StepEvent(ctypes.Structure):
+    _fields_ = [
+        ("seq_id", ctypes.c_size_t),
+        ("token_id", ctypes.c_int64),
+        ("is_finished", ctypes.c_uint8),
+        ("completion_token_ids", ctypes.POINTER(ctypes.c_int64)),
+        ("ncompletion_token", ctypes.c_size_t),
+    ]
+
+class LlaisysQwen2StepEventsResult(ctypes.Structure):
+    _fields_ = [
+        ("events", ctypes.POINTER(LlaisysQwen2StepEvent)),
+        ("nevent", ctypes.c_size_t),
+    ]
+
 def load_models(lib):
     lib.llaisysQwen2ModelCreate.argtypes = [
         ctypes.POINTER(LlaisysQwen2Meta),
@@ -136,6 +151,12 @@ def load_models(lib):
 
     lib.llaisysQwen2StepResultDestroy.argtypes = [ctypes.POINTER(LlaisysQwen2StepResult)]
     lib.llaisysQwen2StepResultDestroy.restype = None
+
+    lib.llaisysQwen2DynamicBatchEngineStepEvents.argtypes = [llaisysQwen2DynamicBatchEngine_p]
+    lib.llaisysQwen2DynamicBatchEngineStepEvents.restype = ctypes.POINTER(LlaisysQwen2StepEventsResult)
+
+    lib.llaisysQwen2StepEventsResultDestroy.argtypes = [ctypes.POINTER(LlaisysQwen2StepEventsResult)]
+    lib.llaisysQwen2StepEventsResultDestroy.restype = None
 
     lib.llaisysQwen2DynamicBatchEngineIsFinished.argtypes = [llaisysQwen2DynamicBatchEngine_p]
     lib.llaisysQwen2DynamicBatchEngineIsFinished.restype = ctypes.c_uint8

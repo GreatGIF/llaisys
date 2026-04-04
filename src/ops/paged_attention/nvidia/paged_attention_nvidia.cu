@@ -67,7 +67,7 @@ __global__ void paged_attention_prefill_kernel(
     const size_t q_len = q_end - q_begin;
     const size_t kv_len = static_cast<size_t>(cu_seqlens_k[seq_idx + 1] - cu_seqlens_k[seq_idx]);
     const size_t num_cached_tokens = kv_len - q_len;
-    const size_t local_q = q_token_idx - q_begin;
+    // const size_t local_q = q_token_idx - q_begin;
     const size_t q_position = static_cast<size_t>(positions[q_token_idx]);
     const size_t group_size = num_heads / num_kv_heads;
     const size_t kv_head = head / group_size;
