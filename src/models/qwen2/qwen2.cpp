@@ -1,17 +1,18 @@
 #include "qwen2.hpp"
 #include "../../ops/add/op.hpp"
-#include "../../ops/argmax/op.hpp"
 #include "../../ops/embedding/op.hpp"
 #include "../../ops/linear/op.hpp"
+#include "../../ops/paged_attention/op.hpp"
 #include "../../ops/rms_norm/op.hpp"
 #include "../../ops/rope/op.hpp"
-#include "../../ops/self_attention/op.hpp"
 #include "../../ops/swiglu/op.hpp"
 #include "../../ops/sampling/op.hpp"
 #include "../../llaisys/llaisys_tensor.hpp"
 #include "../../device/runtime_api.hpp"
+#include "../../utils.hpp"
+#include <algorithm>
 #include <cmath>
-
+#include <cstring>
 namespace llaisys::models {
 
 Qwen2Model::Qwen2Model(const LlaisysQwen2Meta &meta, llaisysDeviceType_t device, int *device_ids, int ndevice)
@@ -89,15 +90,6 @@ Qwen2Model::Qwen2Model(const LlaisysQwen2Meta &meta, llaisysDeviceType_t device,
     _weights_c.mlp_gate_w = _c_mlp_gate_w.data();
     _weights_c.mlp_up_w = _c_mlp_up_w.data();
     _weights_c.mlp_down_w = _c_mlp_down_w.data();
-
-    // 静态预分配创建KV cache, 而不是动态分配
-    _k_cache.resize(_meta.nlayer);
-    _v_cache.resize(_meta.nlayer);
-    for (size_t i = 0; i < _meta.nlayer; ++i) {
-        _k_cache[i] = create_weight({_meta.maxseq, _meta.nkvh, _meta.dh});
-        _v_cache[i] = create_weight({_meta.maxseq, _meta.nkvh, _meta.dh});
-    }
-
     // 预分配中间Tensor变量, 通过复用以减少重复创建Tensor
     _x = create_weight({_meta.maxseq, _meta.hs});
     _x_norm = create_weight({_meta.maxseq, _meta.hs});
@@ -135,175 +127,216 @@ Qwen2Model::~Qwen2Model() {
     }
 }
 
-void Qwen2Model::reset() {
-    // Reset decode cursor for a new request/session.
-    // KV cache tensors are reused and overwritten from position 0 onward.
-    // printf("--- reset ---\n");
-    _cur_pos = 0;
+int64_t Qwen2Model::runSequence(Qwen2PagedRuntimeState &runtime_state,
+                                core::paged_kv::SequenceState &sequence,
+                                bool is_prefill,
+                                const LlaisysQwen2SamplingParams &params) {
+    return infer_batch(runtime_state, {&sequence}, is_prefill, {params})[0];
 }
 
-int64_t Qwen2Model::infer(int64_t *token_ids, size_t ntoken, const LlaisysQwen2SamplingParams &params) {
-    // printf("--- Infer (ntoken=%zu, cur_pos=%zu) tokens ---\n", ntoken, _cur_pos);
+std::vector<int64_t> Qwen2Model::runBatch(
+    Qwen2PagedRuntimeState &runtime_state,
+    const std::vector<std::shared_ptr<core::scheduler::SequenceEntry>> &entries,
+    bool is_prefill,
+    const std::vector<LlaisysQwen2SamplingParams> &params) {
+    CHECK_ARGUMENT(entries.size() == params.size(), "Qwen2Model::runBatch: entries/params size mismatch");
 
-    // _in_embed->slice(0, 1, 10)->debug();
-    // _out_embed->slice(0, 1, 10)->debug();
-    // exit(1);
+    std::vector<core::paged_kv::SequenceState *> sequences;
+    sequences.reserve(entries.size());
+    for (const auto &entry : entries) {
+        CHECK_ARGUMENT(entry != nullptr && entry->sequence != nullptr,
+                       "Qwen2Model::runBatch: null entry/sequence");
+        sequences.push_back(entry->sequence.get());
+    }
+    return infer_batch(runtime_state, sequences, is_prefill, params);
+}
 
-    // auto create_tmp = [&](const std::vector<size_t> &shape) {
-    //     return Tensor::create(shape, _meta.dtype, _device_type, _device_id);
-    // };
+std::vector<int64_t> Qwen2Model::infer_batch(
+    Qwen2PagedRuntimeState &runtime_state,
+    const std::vector<core::paged_kv::SequenceState *> &sequences,
+    bool is_prefill,
+    const std::vector<LlaisysQwen2SamplingParams> &params) {
+    CHECK_ARGUMENT(!sequences.empty(), "Qwen2Model::infer_batch: sequences must not be empty");
+    CHECK_ARGUMENT(sequences.size() == params.size(), "Qwen2Model::infer_batch: sequences/params size mismatch");
 
+    std::vector<core::paged_kv::SequenceState *> prefill_sequences;
+    std::vector<LlaisysQwen2SamplingParams> prefill_params;
+    std::vector<size_t> prefill_order;
+    std::vector<core::paged_kv::SequenceState *> decode_sequences;
+    std::vector<LlaisysQwen2SamplingParams> decode_params;
+    std::vector<size_t> decode_order;
+
+    for (size_t i = 0; i < sequences.size(); ++i) {
+            CHECK_ARGUMENT(sequences[i] != nullptr, "Qwen2Model::infer_batch: null sequence");
+        const bool has_prefill_tokens = sequences[i]->numCachedTokens() < sequences[i]->numTokens();
+        if (is_prefill && has_prefill_tokens) {
+            prefill_sequences.push_back(sequences[i]);
+            prefill_params.push_back(params[i]);
+            prefill_order.push_back(i);
+        } else {
+            decode_sequences.push_back(sequences[i]);
+            decode_params.push_back(params[i]);
+            decode_order.push_back(i);
+        }
+    }
+
+    std::vector<int64_t> outputs(sequences.size(), 0);
+
+    auto run_group = [&](const std::vector<core::paged_kv::SequenceState *> &group_sequences,
+                         const std::vector<LlaisysQwen2SamplingParams> &group_params,
+                         bool group_is_prefill) -> std::vector<int64_t> {
+        if (group_sequences.empty()) {
+            return {};
+        }
+
+        core::paged_kv::PrefillBatch prefill_batch;
+        core::paged_kv::DecodeBatch decode_batch;
+        std::vector<int64_t> compute_input_ids;
+        std::vector<int64_t> compute_positions;
+        std::vector<size_t> last_token_indices;
+
+        if (group_is_prefill) {
+            prefill_batch = core::paged_kv::BlockManager::preparePrefill(group_sequences, PAGED_KV_BLOCK_SIZE);
+            compute_input_ids = prefill_batch.input_ids;
+            compute_positions = prefill_batch.positions;
+            for (size_t i = 0; i + 1 < prefill_batch.cu_seqlens_q.size(); ++i) {
+                const size_t q_begin = static_cast<size_t>(prefill_batch.cu_seqlens_q[i]);
+                const size_t q_end = static_cast<size_t>(prefill_batch.cu_seqlens_q[i + 1]);
+                CHECK_ARGUMENT(q_end > q_begin, "Qwen2Model::infer_batch: prefill sequence has no query tokens");
+                last_token_indices.push_back(q_end - 1);
+            }
+        } else {
+            decode_batch = core::paged_kv::BlockManager::prepareDecode(group_sequences, PAGED_KV_BLOCK_SIZE);
+            compute_input_ids = decode_batch.input_ids;
+            compute_positions = decode_batch.positions;
+            for (size_t i = 0; i < decode_batch.input_ids.size(); ++i) {
+                last_token_indices.push_back(i);
+            }
+        }
+
+        const size_t q_token_count = compute_input_ids.size();
+        CHECK_ARGUMENT(q_token_count > 0, "Qwen2Model::infer_batch: no query tokens to process");
+        CHECK_ARGUMENT(q_token_count <= _meta.maxseq,
+                       "Qwen2Model::infer_batch: q_token_count exceeds preallocated model buffers");
+
+        auto tokens_cpu = Tensor::create({q_token_count}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU, 0);
+        tokens_cpu->load(compute_input_ids.data());
+        auto pos_ids_cpu = Tensor::create({q_token_count}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU, 0);
+        pos_ids_cpu->load(compute_positions.data());
+        auto tokens_device = (_device_type == LLAISYS_DEVICE_CPU) ? tokens_cpu : tokens_cpu->to(_device_type, _device_id);
+        auto pos_ids = (_device_type == LLAISYS_DEVICE_CPU) ? pos_ids_cpu : pos_ids_cpu->to(_device_type, _device_id);
+
+        auto x = _x->view({q_token_count, _meta.hs});
+        ops::embedding(x, tokens_device, _in_embed);
+
+        for (size_t layer = 0; layer < _meta.nlayer; ++layer) {
+            auto residual = x;
+            auto x_norm = _x_norm->view({q_token_count, _meta.hs});
+            ops::rms_norm(x_norm, x, _attn_norm_w[layer], _meta.epsilon);
+
+            auto q = _q->view({q_token_count, _meta.nh, _meta.dh});
+            auto k = _k->view({q_token_count, _meta.nkvh, _meta.dh});
+            auto v = _v->view({q_token_count, _meta.nkvh, _meta.dh});
+
+            ops::linear(q->view({q_token_count, _meta.nh * _meta.dh}), x_norm, _attn_q_w[layer], _attn_q_b[layer]);
+            ops::linear(k->view({q_token_count, _meta.nkvh * _meta.dh}), x_norm, _attn_k_w[layer], _attn_k_b[layer]);
+            ops::linear(v->view({q_token_count, _meta.nkvh * _meta.dh}), x_norm, _attn_v_w[layer], _attn_v_b[layer]);
+
+            auto q_rope = q;
+            auto k_rope = k;
+            ops::rope(q_rope, q, pos_ids, _meta.theta);
+            ops::rope(k_rope, k, pos_ids, _meta.theta);
+
+            const auto &slot_mapping = group_is_prefill ? prefill_batch.slot_mapping : decode_batch.slot_mapping;
+            ops::store_paged_kv_cache(runtime_state.kCache(layer), runtime_state.vCache(layer), k_rope, v, slot_mapping);
+
+            auto attn_out = _attn_out->view({q_token_count, _meta.nh, _meta.dh});
+            if (group_is_prefill) {
+                ops::paged_attention_prefill(attn_out, q_rope, runtime_state.kCache(layer), runtime_state.vCache(layer),
+                                             prefill_batch, _meta.nkvh,
+                                             1.0f / sqrtf(static_cast<float>(_meta.dh)));
+            } else {
+                ops::paged_attention_decode(attn_out, q_rope, runtime_state.kCache(layer), runtime_state.vCache(layer),
+                                            decode_batch, _meta.nkvh,
+                                            1.0f / sqrtf(static_cast<float>(_meta.dh)));
+            }
+
+            auto attn_proj = _attn_proj->view({q_token_count, _meta.hs});
+            ops::linear(attn_proj, attn_out->view({q_token_count, _meta.nh * _meta.dh}), _attn_o_w[layer], nullptr);
+            ops::add(x, residual, attn_proj);
+
+            residual = x;
+            auto x_norm_mlp = _x_norm_mlp->view({q_token_count, _meta.hs});
+            ops::rms_norm(x_norm_mlp, x, _mlp_norm_w[layer], _meta.epsilon);
+
+            auto gate = _mlp_gate->view({q_token_count, _meta.di});
+            auto up = _mlp_up->view({q_token_count, _meta.di});
+            ops::linear(gate, x_norm_mlp, _mlp_gate_w[layer], nullptr);
+            ops::linear(up, x_norm_mlp, _mlp_up_w[layer], nullptr);
+
+            auto mlp_gate_out = _mlp_gate_out->view({q_token_count, _meta.di});
+            ops::swiglu(mlp_gate_out, gate, up);
+
+            auto mlp_down_out = _mlp_down_out->view({q_token_count, _meta.hs});
+            ops::linear(mlp_down_out, mlp_gate_out, _mlp_down_w[layer], nullptr);
+            ops::add(x, residual, mlp_down_out);
+        }
+
+        for (auto *sequence : group_sequences) {
+            sequence->setNumCachedTokens(sequence->numTokens());
+        }
+
+        return sample_from_hidden(x, last_token_indices, group_params);
+    };
+
+    const auto prefill_outputs = run_group(prefill_sequences, prefill_params, true);
+    const auto decode_outputs = run_group(decode_sequences, decode_params, false);
+
+    for (size_t i = 0; i < prefill_outputs.size(); ++i) {
+        outputs[prefill_order[i]] = prefill_outputs[i];
+    }
+    for (size_t i = 0; i < decode_outputs.size(); ++i) {
+        outputs[decode_order[i]] = decode_outputs[i];
+    }
+
+    return outputs;
+}
+
+std::vector<int64_t> Qwen2Model::sample_from_hidden(
+    tensor_t hidden_states,
+    const std::vector<size_t> &last_token_indices,
+    const std::vector<LlaisysQwen2SamplingParams> &params) {
+    CHECK_ARGUMENT(last_token_indices.size() == params.size(),
+                   "Qwen2Model::sample_from_hidden: indices/params size mismatch");
+    const size_t batch_size = last_token_indices.size();
+    CHECK_ARGUMENT(batch_size > 0, "Qwen2Model::sample_from_hidden: batch_size must be greater than 0");
+
+    auto x_last = Tensor::create({batch_size, _meta.hs}, _meta.dtype, _device_type, _device_id);
+    const size_t row_bytes = _meta.hs * hidden_states->elementSize();
+    const auto *src = hidden_states->data();
+    auto *dst = x_last->data();
     const LlaisysRuntimeAPI *api = device::getRuntimeAPI(_device_type);
-
-    // 1. Tokens to device tensor
-    tensor_t tokens_device;
-    {
-        auto tokens_cpu = Tensor::create({ntoken}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU, 0);
-        tokens_cpu->load(token_ids);
-        if (_device_type == LLAISYS_DEVICE_CPU) {
-            tokens_device = tokens_cpu;
-        } else {
-            tokens_device = tokens_cpu->to(_device_type, _device_id);
-        }
+    for (size_t i = 0; i < batch_size; ++i) {
+        const size_t row = last_token_indices[i];
+        api->memcpy_sync(dst + i * row_bytes, src + row * row_bytes, row_bytes, LLAISYS_MEMCPY_D2D);
     }
 
-    // 2. Embedding
-    // auto x = create_tmp({ntoken, _meta.hs});
-    auto x = _x->view({ntoken, _meta.hs});
-    ops::embedding(x, tokens_device, _in_embed);
-
-    // 3. Position IDs for RoPE
-    tensor_t pos_ids;
-    {
-        auto pos_ids_cpu = Tensor::create({ntoken}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU, 0);
-        int64_t *pos_ptr = (int64_t *)pos_ids_cpu->data();
-        for (size_t i = 0; i < ntoken; ++i)
-            pos_ptr[i] = _cur_pos + i;
-        if (_device_type == LLAISYS_DEVICE_CPU) {
-            pos_ids = pos_ids_cpu;
-        } else {
-            pos_ids = pos_ids_cpu->to(_device_type, _device_id);
-        }
-    }
-
-    // 4. Layers
-    for (size_t i = 0; i < _meta.nlayer; ++i) {
-        auto residual = x;
-
-        // Norm
-        // auto x_norm = create_tmp({ntoken, _meta.hs});
-        auto x_norm = _x_norm->view({ntoken, _meta.hs});
-        ops::rms_norm(x_norm, x, _attn_norm_w[i], _meta.epsilon);
-
-        // QKV Projections
-        // auto q = create_tmp({ntoken, _meta.nh, _meta.dh});
-        // auto k = create_tmp({ntoken, _meta.nkvh, _meta.dh});
-        // auto v = create_tmp({ntoken, _meta.nkvh, _meta.dh});
-        auto q = _q->view({ntoken, _meta.nh, _meta.dh});
-        auto k = _k->view({ntoken, _meta.nkvh, _meta.dh});
-        auto v = _v->view({ntoken, _meta.nkvh, _meta.dh});
-
-        ops::linear(q->view({ntoken, _meta.nh * _meta.dh}), x_norm, _attn_q_w[i], _attn_q_b[i]);
-        ops::linear(k->view({ntoken, _meta.nkvh * _meta.dh}), x_norm, _attn_k_w[i], _attn_k_b[i]);
-        ops::linear(v->view({ntoken, _meta.nkvh * _meta.dh}), x_norm, _attn_v_w[i], _attn_v_b[i]);
-
-        // RoPE
-        // auto q_rope = create_tmp({ntoken, _meta.nh, _meta.dh});
-        // auto k_rope = create_tmp({ntoken, _meta.nkvh, _meta.dh});
-        // in place
-        auto q_rope = q;
-        auto k_rope = k;
-        ops::rope(q_rope, q, pos_ids, _meta.theta);
-        ops::rope(k_rope, k, pos_ids, _meta.theta);
-
-        // KV Cache Update
-        auto k_cache_slice = _k_cache[i]->slice(0, _cur_pos, _cur_pos + ntoken);
-        auto v_cache_slice = _v_cache[i]->slice(0, _cur_pos, _cur_pos + ntoken);
-
-        // Copy to cache
-        api->memcpy_sync(k_cache_slice->data(), k_rope->data(), k_rope->numel() * k_rope->elementSize(), LLAISYS_MEMCPY_D2D);
-        api->memcpy_sync(v_cache_slice->data(), v->data(), v->numel() * v->elementSize(), LLAISYS_MEMCPY_D2D);
-
-        // Full KV up to now
-        auto k_full = _k_cache[i]->slice(0, 0, _cur_pos + ntoken);
-        auto v_full = _v_cache[i]->slice(0, 0, _cur_pos + ntoken);
-
-        // Multi-head Attention
-        // auto attn_out = create_tmp({ntoken, _meta.nh, _meta.dh});
-        auto attn_out = _attn_out->view({ntoken, _meta.nh, _meta.dh});
-        ops::self_attention(attn_out, q_rope, k_full, v_full, 1.0f / sqrtf(static_cast<float>(_meta.dh)));
-
-        // Output Projection
-        // auto attn_proj = create_tmp({ntoken, _meta.hs})
-        auto attn_proj = _attn_proj->view({ntoken, _meta.hs});
-        ops::linear(attn_proj, attn_out->view({ntoken, _meta.nh * _meta.dh}), _attn_o_w[i], nullptr);
-
-        // Add
-        // auto x_new = create_tmp({ntoken, _meta.hs});
-        // ops::add(x_new, residual, attn_proj);
-        // x = x_new;
-        // add支持inplace
-        ops::add(x, residual, attn_proj);
-
-        // MLP
-        residual = x;
-        // auto x_norm_mlp = create_tmp({ntoken, _meta.hs});
-        auto x_norm_mlp = _x_norm_mlp->view({ntoken, _meta.hs});
-        ops::rms_norm(x_norm_mlp, x, _mlp_norm_w[i], _meta.epsilon);
-
-        // auto gate = create_tmp({ntoken, _meta.di});
-        // auto up = create_tmp({ntoken, _meta.di});
-        auto gate = _mlp_gate->view({ntoken, _meta.di});
-        auto up = _mlp_up->view({ntoken, _meta.di});
-        ops::linear(gate, x_norm_mlp, _mlp_gate_w[i], nullptr);
-        ops::linear(up, x_norm_mlp, _mlp_up_w[i], nullptr);
-
-        // auto mlp_gate_out = create_tmp({ntoken, _meta.di});
-        auto mlp_gate_out = _mlp_gate_out->view({ntoken, _meta.di});
-        ops::swiglu(mlp_gate_out, gate, up);
-
-        // auto mlp_down_out = create_tmp({ntoken, _meta.hs});
-        auto mlp_down_out = _mlp_down_out->view({ntoken, _meta.hs});
-        ops::linear(mlp_down_out, mlp_gate_out, _mlp_down_w[i], nullptr);
-
-        // auto x_final = create_tmp({ntoken, _meta.hs});
-        // ops::add(x_final, residual, mlp_down_out);
-        // x = x_final;
-        // add支持inplace
-        ops::add(x, residual, mlp_down_out);
-    }
-
-    _cur_pos += ntoken;
-
-    // 5. Final Norm & LM Head (only for the last token)
-    auto x_last = x->slice(0, ntoken - 1, ntoken);
-    // auto x_last_norm = create_tmp({1, _meta.hs});
-    auto x_last_norm = _x_last_norm;
+    auto x_last_norm = Tensor::create({batch_size, _meta.hs}, _meta.dtype, _device_type, _device_id);
     ops::rms_norm(x_last_norm, x_last, _out_norm_w, _meta.epsilon);
 
-    // auto logits = create_tmp({1, _meta.voc});
-    auto logits = _logits;
+    auto logits = Tensor::create({batch_size, _meta.voc}, _meta.dtype, _device_type, _device_id);
     ops::linear(logits, x_last_norm, _out_embed, nullptr);
 
-    // 6. Argmax (on GPU if available, only transfer result back to CPU)
-    auto next_token_idx = Tensor::create({1}, LLAISYS_DTYPE_I64, _device_type, _device_id);
-    auto max_val = Tensor::create({1}, _meta.dtype, _device_type, _device_id);
+    auto next_token_idx = Tensor::create({batch_size}, LLAISYS_DTYPE_I64, _device_type, _device_id);
+    for (size_t i = 0; i < batch_size; ++i) {
+        auto logits_row = logits->slice(0, i, i + 1);
+        auto token_row = next_token_idx->slice(0, i, i + 1);
+        ops::sampling(token_row, logits_row, params[i].temperature, params[i].top_k, params[i].top_p, params[i].seed);
+    }
 
-    // if (decoding_type == LLAISYS_QWEN2_SAMPLING) {
-    //     // Use sampling for decoding
-    //     ops::sampling(next_token_idx, logits->view({1, _meta.voc}), 
-    //                  params.temperature, params.top_k, params.top_p, params.seed);
-    // } else {
-    //     // Default: use argmax
-    //     auto max_val = Tensor::create({1}, _meta.dtype, _device_type, _device_id);
-    //     ops::argmax(next_token_idx, max_val, logits->view({_meta.voc}));
-    // }
-    ops::sampling(next_token_idx, logits->view({1, _meta.voc}), 
-                  params.temperature, params.top_k, params.top_p, params.seed);
-
-    // Transfer result from device to CPU for return
-    auto next_token_idx_cpu = next_token_idx->to(LLAISYS_DEVICE_CPU, 0);
-    return *(int64_t *)next_token_idx_cpu->data();
+    auto next_token_idx_cpu = (_device_type == LLAISYS_DEVICE_CPU) ? next_token_idx : next_token_idx->to(LLAISYS_DEVICE_CPU, 0);
+    const int64_t *tokens = reinterpret_cast<const int64_t *>(next_token_idx_cpu->data());
+    return std::vector<int64_t>(tokens, tokens + batch_size);
 }
 
 } // namespace llaisys::models

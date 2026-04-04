@@ -209,6 +209,9 @@ tensor_t Tensor::view(const std::vector<size_t> &shape) const {
             new_meta.strides[i] = expected_stride;
             expected_stride *= new_meta.shape[i];
         }
+        const size_t required_bytes = expected_stride * elementSize();
+        CHECK_ARGUMENT(_offset + required_bytes <= _storage->size(),
+                       "Tensor::view: requested view exceeds backing storage");
         return std::shared_ptr<Tensor>(new Tensor(new_meta, _storage));
     }
     // return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));

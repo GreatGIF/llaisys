@@ -5,7 +5,10 @@ import ctypes
 import torch
 from ..libllaisys import LIB_LLAISYS
 from ..libllaisys import DeviceType, DataType
-from ..libllaisys.models import LlaisysQwen2Meta
+from ..libllaisys.models import (
+    LlaisysQwen2Meta,
+    LlaisysQwen2SamplingParams,
+)
 from ..tensor import Tensor
 
 from pathlib import Path
@@ -113,8 +116,6 @@ class Qwen2:
             # New request/session: clear backend decode cursor/KV-cache position.
             LIB_LLAISYS.llaisysQwen2ModelReset(self._model)
 
-        from ..libllaisys.models import LlaisysQwen2SamplingParams
-
         # Seed policy:
         # - seed == 0: non-deterministic per generation call (random base seed)
         # - seed != 0: deterministic/reproducible across runs
@@ -162,3 +163,127 @@ class Qwen2:
         output_tokens = list(inputs)
         output_tokens.extend(_token_generator())
         return output_tokens
+
+
+class Qwen2Session:
+    def __init__(self, model: Qwen2, seq_id: int = 0):
+        self._model_owner = model
+        self._session = LIB_LLAISYS.llaisysQwen2SessionCreate(model._model, ctypes.c_size_t(seq_id))
+
+    def __del__(self):
+        if hasattr(self, "_session") and self._session:
+            LIB_LLAISYS.llaisysQwen2SessionDestroy(self._session)
+            self._session = None
+
+    def reset(self):
+        LIB_LLAISYS.llaisysQwen2SessionReset(self._session)
+
+    def infer(self, inputs: Sequence[int], temperature: float = 1.0,
+              top_k: int = 0, top_p: float = 0.0, seed: int = 0) -> int:
+        params = LlaisysQwen2SamplingParams(
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            seed=seed if seed != 0 else secrets.randbits(64),
+        )
+        token_ids = (ctypes.c_int64 * len(inputs))(*inputs)
+        return int(LIB_LLAISYS.llaisysQwen2SessionInfer(
+            self._session, token_ids, ctypes.c_size_t(len(inputs)), ctypes.byref(params)
+        ))
+
+
+class Qwen2DynamicBatchEngine:
+    def __init__(self, model_path, device: DeviceType = DeviceType.CPU,
+                 max_num_seqs: int = 32, max_num_batched_tokens: int = 1024):
+        model_path = Path(model_path)
+        with open(model_path / "config.json", "r") as f:
+            config = json.load(f)
+
+        meta = LlaisysQwen2Meta()
+        meta.dtype = DataType.BF16
+        meta.nlayer = config["num_hidden_layers"]
+        meta.hs = config["hidden_size"]
+        meta.nh = config["num_attention_heads"]
+        meta.nkvh = config.get("num_key_value_heads", meta.nh)
+        meta.dh = meta.hs // meta.nh
+        meta.di = config["intermediate_size"]
+        meta.maxseq = config.get("max_position_embeddings", 131072)
+        meta.voc = config["vocab_size"]
+        meta.epsilon = config.get("rms_norm_eps", 1e-6)
+        meta.theta = config.get("rope_theta", 1000000.0)
+        meta.end_token = config.get("eos_token_id", 151643)
+        self.end_token = meta.end_token
+        self.tied = config.get("tie_word_embeddings", False)
+
+        device_ids = (ctypes.c_int * 1)(0)
+        self._engine = LIB_LLAISYS.llaisysQwen2DynamicBatchEngineCreate(
+            ctypes.byref(meta), device, device_ids, 1,
+            ctypes.c_size_t(max_num_seqs), ctypes.c_size_t(max_num_batched_tokens)
+        )
+
+        weights_ptr = LIB_LLAISYS.llaisysQwen2DynamicBatchEngineWeights(self._engine)
+        weights = weights_ptr.contents
+        name_map = {
+            "model.embed_tokens.weight": weights.in_embed,
+            "lm_head.weight": weights.out_embed,
+            "model.norm.weight": weights.out_norm_w,
+        }
+        for i in range(meta.nlayer):
+            name_map[f"model.layers.{i}.input_layernorm.weight"] = weights.attn_norm_w[i]
+            name_map[f"model.layers.{i}.self_attn.q_proj.weight"] = weights.attn_q_w[i]
+            name_map[f"model.layers.{i}.self_attn.k_proj.weight"] = weights.attn_k_w[i]
+            name_map[f"model.layers.{i}.self_attn.v_proj.weight"] = weights.attn_v_w[i]
+            name_map[f"model.layers.{i}.self_attn.q_proj.bias"] = weights.attn_q_b[i]
+            name_map[f"model.layers.{i}.self_attn.k_proj.bias"] = weights.attn_k_b[i]
+            name_map[f"model.layers.{i}.self_attn.v_proj.bias"] = weights.attn_v_b[i]
+            name_map[f"model.layers.{i}.self_attn.o_proj.weight"] = weights.attn_o_w[i]
+            name_map[f"model.layers.{i}.post_attention_layernorm.weight"] = weights.mlp_norm_w[i]
+            name_map[f"model.layers.{i}.mlp.gate_proj.weight"] = weights.mlp_gate_w[i]
+            name_map[f"model.layers.{i}.mlp.up_proj.weight"] = weights.mlp_up_w[i]
+            name_map[f"model.layers.{i}.mlp.down_proj.weight"] = weights.mlp_down_w[i]
+
+        for file in sorted(model_path.glob("*.safetensors")):
+            with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+                for name in f.keys():
+                    if name in name_map:
+                        data = f.get_tensor(name)
+                        ptr = data.data_ptr()
+                        if name == "model.embed_tokens.weight" and self.tied:
+                            LIB_LLAISYS.tensorLoad(weights.out_embed, ctypes.c_void_p(ptr))
+                        LIB_LLAISYS.tensorLoad(name_map[name], ctypes.c_void_p(ptr))
+
+    def __del__(self):
+        if hasattr(self, "_engine") and self._engine:
+            LIB_LLAISYS.llaisysQwen2DynamicBatchEngineDestroy(self._engine)
+            self._engine = None
+
+    def add_request(self, inputs: Sequence[int], max_completion_tokens: int,
+                    temperature: float = 1.0, top_k: int = 0, top_p: float = 0.0,
+                    seed: int = 0, ignore_eos: bool = False) -> int:
+        params = LlaisysQwen2SamplingParams(
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            seed=seed if seed != 0 else secrets.randbits(64),
+        )
+        token_ids = (ctypes.c_int64 * len(inputs))(*inputs)
+        return int(LIB_LLAISYS.llaisysQwen2DynamicBatchEngineAddRequest(
+            self._engine, token_ids, ctypes.c_size_t(len(inputs)),
+            ctypes.c_size_t(max_completion_tokens), ctypes.byref(params), ctypes.c_uint8(ignore_eos)
+        ))
+
+    def step(self):
+        result = LIB_LLAISYS.llaisysQwen2DynamicBatchEngineStep(self._engine)
+        try:
+            outputs = []
+            n = result.contents.nsequence
+            for i in range(n):
+                seq = result.contents.sequences[i]
+                token_ids = [seq.token_ids[j] for j in range(seq.ntoken)]
+                outputs.append({"seq_id": int(seq.seq_id), "token_ids": token_ids})
+            return outputs
+        finally:
+            LIB_LLAISYS.llaisysQwen2StepResultDestroy(result)
+
+    def is_finished(self) -> bool:
+        return bool(LIB_LLAISYS.llaisysQwen2DynamicBatchEngineIsFinished(self._engine))

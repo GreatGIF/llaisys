@@ -46,6 +46,21 @@ class LlaisysQwen2Weights(ctypes.Structure):
     ]
 
 llaisysQwen2Model_p = ctypes.c_void_p
+llaisysQwen2Session_p = ctypes.c_void_p
+llaisysQwen2DynamicBatchEngine_p = ctypes.c_void_p
+
+class LlaisysQwen2FinishedSequence(ctypes.Structure):
+    _fields_ = [
+        ("seq_id", ctypes.c_size_t),
+        ("token_ids", ctypes.POINTER(ctypes.c_int64)),
+        ("ntoken", ctypes.c_size_t),
+    ]
+
+class LlaisysQwen2StepResult(ctypes.Structure):
+    _fields_ = [
+        ("sequences", ctypes.POINTER(LlaisysQwen2FinishedSequence)),
+        ("nsequence", ctypes.c_size_t),
+    ]
 
 def load_models(lib):
     lib.llaisysQwen2ModelCreate.argtypes = [
@@ -72,3 +87,55 @@ def load_models(lib):
         ctypes.POINTER(LlaisysQwen2SamplingParams),
     ]
     lib.llaisysQwen2ModelInfer.restype = ctypes.c_int64
+
+    lib.llaisysQwen2SessionCreate.argtypes = [llaisysQwen2Model_p, ctypes.c_size_t]
+    lib.llaisysQwen2SessionCreate.restype = llaisysQwen2Session_p
+
+    lib.llaisysQwen2SessionDestroy.argtypes = [llaisysQwen2Session_p]
+    lib.llaisysQwen2SessionDestroy.restype = None
+
+    lib.llaisysQwen2SessionReset.argtypes = [llaisysQwen2Session_p]
+    lib.llaisysQwen2SessionReset.restype = None
+
+    lib.llaisysQwen2SessionInfer.argtypes = [
+        llaisysQwen2Session_p,
+        ctypes.POINTER(ctypes.c_int64),
+        ctypes.c_size_t,
+        ctypes.POINTER(LlaisysQwen2SamplingParams),
+    ]
+    lib.llaisysQwen2SessionInfer.restype = ctypes.c_int64
+
+    lib.llaisysQwen2DynamicBatchEngineCreate.argtypes = [
+        ctypes.POINTER(LlaisysQwen2Meta),
+        llaisysDeviceType_t,
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_int,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+    ]
+    lib.llaisysQwen2DynamicBatchEngineCreate.restype = llaisysQwen2DynamicBatchEngine_p
+
+    lib.llaisysQwen2DynamicBatchEngineDestroy.argtypes = [llaisysQwen2DynamicBatchEngine_p]
+    lib.llaisysQwen2DynamicBatchEngineDestroy.restype = None
+
+    lib.llaisysQwen2DynamicBatchEngineWeights.argtypes = [llaisysQwen2DynamicBatchEngine_p]
+    lib.llaisysQwen2DynamicBatchEngineWeights.restype = ctypes.POINTER(LlaisysQwen2Weights)
+
+    lib.llaisysQwen2DynamicBatchEngineAddRequest.argtypes = [
+        llaisysQwen2DynamicBatchEngine_p,
+        ctypes.POINTER(ctypes.c_int64),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.POINTER(LlaisysQwen2SamplingParams),
+        ctypes.c_uint8,
+    ]
+    lib.llaisysQwen2DynamicBatchEngineAddRequest.restype = ctypes.c_size_t
+
+    lib.llaisysQwen2DynamicBatchEngineStep.argtypes = [llaisysQwen2DynamicBatchEngine_p]
+    lib.llaisysQwen2DynamicBatchEngineStep.restype = ctypes.POINTER(LlaisysQwen2StepResult)
+
+    lib.llaisysQwen2StepResultDestroy.argtypes = [ctypes.POINTER(LlaisysQwen2StepResult)]
+    lib.llaisysQwen2StepResultDestroy.restype = None
+
+    lib.llaisysQwen2DynamicBatchEngineIsFinished.argtypes = [llaisysQwen2DynamicBatchEngine_p]
+    lib.llaisysQwen2DynamicBatchEngineIsFinished.restype = ctypes.c_uint8

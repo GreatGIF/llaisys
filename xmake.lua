@@ -253,3 +253,100 @@ target("llaisys")
         end
     end)
 target_end()
+
+target("paged-kv-test")
+    set_kind("binary")
+    add_deps("llaisys-utils", "llaisys-core")
+
+    set_languages("cxx17")
+    set_warnings("all", "error")
+    if not is_plat("windows") then
+        add_cxflags("-fPIC", "-Wno-unknown-pragmas")
+    end
+
+    add_files("test/paged_kv_test.cpp")
+
+    on_install(function (target) end)
+target_end()
+
+target("paged-attention-test")
+    set_kind("binary")
+    add_deps("llaisys-utils", "llaisys-device", "llaisys-core", "llaisys-tensor", "llaisys-ops")
+
+    set_languages("cxx17")
+    set_warnings("all", "error")
+    if not is_plat("windows") then
+        add_cxflags("-fPIC", "-Wno-unknown-pragmas")
+    end
+
+    add_files("test/paged_attention_test.cpp")
+    add_files("src/llaisys/runtime.cc")
+
+    on_install(function (target) end)
+target_end()
+
+target("qwen2-paged-test")
+    set_kind("binary")
+    add_deps("llaisys-utils", "llaisys-device", "llaisys-core", "llaisys-tensor", "llaisys-ops", "llaisys-models")
+
+    set_languages("cxx17")
+    set_warnings("all", "error")
+    if not is_plat("windows") then
+        add_cxflags("-fPIC", "-Wno-unknown-pragmas")
+    end
+
+    add_files("test/qwen2_paged_test.cpp")
+    add_files("src/llaisys/runtime.cc")
+    add_files("src/llaisys/models/qwen2.cc")
+
+    on_install(function (target) end)
+target_end()
+
+target("qwen2-c-api-test")
+    set_kind("binary")
+    add_deps("llaisys-utils", "llaisys-device", "llaisys-core", "llaisys-tensor", "llaisys-ops", "llaisys-models")
+
+    set_languages("cxx17")
+    set_warnings("all", "error")
+    if not is_plat("windows") then
+        add_cxflags("-fPIC", "-Wno-unknown-pragmas")
+    end
+
+    add_files("test/qwen2_c_api_test.cpp")
+    add_files("src/llaisys/runtime.cc")
+    add_files("src/llaisys/models/qwen2.cc")
+
+    on_install(function (target) end)
+target_end()
+
+target("scheduler-test")
+    set_kind("binary")
+    add_deps("llaisys-utils", "llaisys-device", "llaisys-core")
+
+    set_languages("cxx17")
+    set_warnings("all", "error")
+    if not is_plat("windows") then
+        add_cxflags("-fPIC", "-Wno-unknown-pragmas")
+    end
+
+    add_files("test/scheduler_test.cpp")
+    add_files("src/llaisys/runtime.cc")
+
+    on_install(function (target) end)
+target_end()
+
+target("dynamic-batch-test")
+    set_kind("binary")
+    add_deps("llaisys-utils", "llaisys-device", "llaisys-core", "llaisys-tensor", "llaisys-ops", "llaisys-models")
+
+    set_languages("cxx17")
+    set_warnings("all", "error")
+    if not is_plat("windows") then
+        add_cxflags("-fPIC", "-Wno-unknown-pragmas")
+    end
+
+    add_files("test/dynamic_batch_test.cpp")
+    add_files("src/llaisys/runtime.cc")
+
+    on_install(function (target) end)
+target_end()

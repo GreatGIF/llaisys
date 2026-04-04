@@ -1,6 +1,7 @@
 #include "add_nvidia.cuh"
 
 #include "../../../utils.hpp"
+#include "../../../utils/cuda_cast.hpp"
 
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
@@ -11,7 +12,8 @@ template <typename T>
 __global__ void add_kernel(T *c, const T *a, const T *b, size_t numel) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < numel) {
-        c[idx] = a[idx] + b[idx];
+        float value = llaisys::utils::cuda::to_float(a[idx]) + llaisys::utils::cuda::to_float(b[idx]);
+        c[idx] = llaisys::utils::cuda::from_float<T>(value);
     }
 }
 

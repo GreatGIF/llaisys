@@ -1,20 +1,49 @@
 #pragma once
 #include "llaisys/models/qwen2.h"
+#include "../../core/paged_kv/paged_kv.hpp"
+#include "../../core/scheduler/scheduler.hpp"
 #include "../../tensor/tensor.hpp"
+#include "qwen2_runtime_state.hpp"
+#include <memory>
 #include <vector>
 
 namespace llaisys::models {
 
+class Qwen2Session;
+
 class Qwen2Model {
 public:
+    static constexpr size_t pagedBlockSize() { return PAGED_KV_BLOCK_SIZE; }
+
     Qwen2Model(const LlaisysQwen2Meta &meta, llaisysDeviceType_t device, int *device_ids, int ndevice);
     ~Qwen2Model();
 
     LlaisysQwen2Weights &weights() { return _weights_c; }
-    void reset();
-    int64_t infer(int64_t *token_ids, size_t ntoken, const LlaisysQwen2SamplingParams &params);
+    const LlaisysQwen2Meta &meta() const { return _meta; }
+    llaisysDeviceType_t deviceType() const { return _device_type; }
+    int deviceId() const { return _device_id; }
+    int64_t runSequence(Qwen2PagedRuntimeState &runtime_state,
+                        core::paged_kv::SequenceState &sequence,
+                        bool is_prefill,
+                        const LlaisysQwen2SamplingParams &params);
+    std::vector<int64_t> runBatch(
+        Qwen2PagedRuntimeState &runtime_state,
+        const std::vector<std::shared_ptr<core::scheduler::SequenceEntry>> &entries,
+        bool is_prefill,
+        const std::vector<LlaisysQwen2SamplingParams> &params);
 
 private:
+    static constexpr size_t PAGED_KV_BLOCK_SIZE = 16;
+    std::vector<int64_t> infer_batch(
+        Qwen2PagedRuntimeState &runtime_state,
+        const std::vector<core::paged_kv::SequenceState *> &sequences,
+        bool is_prefill,
+        const std::vector<LlaisysQwen2SamplingParams> &params);
+    std::vector<int64_t> sample_from_hidden(
+        tensor_t hidden_states,
+        const std::vector<size_t> &last_token_indices,
+        const std::vector<LlaisysQwen2SamplingParams> &params);
+
     LlaisysQwen2Meta _meta;
     LlaisysQwen2Weights _weights_c;
     
@@ -40,12 +69,6 @@ private:
     std::vector<llaisysTensor_t> _c_attn_o_w;
     std::vector<llaisysTensor_t> _c_mlp_norm_w;
     std::vector<llaisysTensor_t> _c_mlp_gate_w, _c_mlp_up_w, _c_mlp_down_w;
-
-    // 静态预分配KV Cache, 而不是动态分配
-    // todo: 动态分配, 减少内存占用
-    std::vector<tensor_t> _k_cache;
-    std::vector<tensor_t> _v_cache;
-    size_t _cur_pos = 0;
 
     // 提前创建中间结果的tensor, 通过复用以减少infer时的内存开销
     // device tensor

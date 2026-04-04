@@ -12,6 +12,10 @@ import json
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from enum import Enum
+from threading import Lock, Thread
+from queue import Queue, Empty
+from dataclasses import dataclass
+from contextlib import asynccontextmanager
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -20,9 +24,6 @@ from huggingface_hub import snapshot_download
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
-
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-
 
 # ============================================================================
 # Helper Functions
@@ -123,8 +124,19 @@ class ModelManager:
         self.seed = seed
         self.tokenizer = None
         self.model = None
+        self.llaisys_session = None
+        self.llaisys_batch_engine = None
         self.device_map = self._get_device_map()
         self.cached_token_ids = []
+        self._llaisys_lock = Lock()
+        self._llaisys_use_dynamic_batch = False
+        self._llaisys_worker = None
+        self._llaisys_request_queue = Queue()
+        self._llaisys_pending = {}
+        self._llaisys_stop = False
+        self._llaisys_batch_wait_ms = float(os.environ.get("LLAISYS_BATCH_WAIT_MS", "5"))
+        self._llaisys_batch_max_queue = int(os.environ.get("LLAISYS_BATCH_MAX_QUEUE", "32"))
+        self._llaisys_request_timeout_s = float(os.environ.get("LLAISYS_REQUEST_TIMEOUT_S", "30"))
 
     def _get_device_map(self) -> str | dict:
         """Get appropriate device mapping for the model."""
@@ -168,9 +180,73 @@ class ModelManager:
             import llaisys
             llaisys_device_type = get_llaisys_device(self.device)
             self.model = llaisys.models.Qwen2(model_path, llaisys_device_type)
+            self.llaisys_session = llaisys.models.Qwen2Session(self.model)
+            self.llaisys_use_dynamic_batch = os.environ.get("LLAISYS_DYNAMIC_BATCH", "0") == "1"
+            if self.llaisys_use_dynamic_batch:
+                max_num_seqs = int(os.environ.get("LLAISYS_MAX_NUM_SEQS", "32"))
+                max_num_batched_tokens = int(os.environ.get("LLAISYS_MAX_NUM_BATCHED_TOKENS", "1024"))
+                self.llaisys_batch_engine = llaisys.models.Qwen2DynamicBatchEngine(
+                    model_path,
+                    llaisys_device_type,
+                    max_num_seqs=max_num_seqs,
+                    max_num_batched_tokens=max_num_batched_tokens,
+                )
+                self._llaisys_worker = Thread(target=self._llaisys_batch_loop, daemon=True)
+                self._llaisys_worker.start()
             print("LLAISYS model loaded successfully")
         else:
             raise ValueError(f"Unknown backend: {self.backend}")
+
+    def shutdown(self):
+        self._llaisys_stop = True
+        if self._llaisys_worker is not None and self._llaisys_worker.is_alive():
+            self._llaisys_worker.join(timeout=1.0)
+
+    def _llaisys_batch_loop(self):
+        while not self._llaisys_stop:
+            if not self.llaisys_batch_engine:
+                time.sleep(0.01)
+                continue
+            collected = []
+            try:
+                request = self._llaisys_request_queue.get(timeout=0.01)
+                collected.append(request)
+                deadline = time.time() + self._llaisys_batch_wait_ms / 1000.0
+                while len(collected) < self._llaisys_batch_max_queue:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        collected.append(self._llaisys_request_queue.get(timeout=remaining))
+                    except Empty:
+                        break
+            except Empty:
+                pass
+
+            try:
+                for request in collected:
+                    seq_id = self.llaisys_batch_engine.add_request(
+                        request.input_ids,
+                        max_completion_tokens=request.max_completion_tokens,
+                        temperature=request.temperature,
+                        top_k=request.top_k,
+                        top_p=request.top_p,
+                        seed=request.seed,
+                        ignore_eos=request.ignore_eos,
+                    )
+                    self._llaisys_pending[seq_id] = request
+
+                if self.llaisys_batch_engine.is_finished():
+                    continue
+
+                finished = self.llaisys_batch_engine.step()
+                for item in finished:
+                    req = self._llaisys_pending.pop(item["seq_id"], None)
+                    if req is not None:
+                        req.result_queue.put(("ok", item["token_ids"]))
+            except Exception as exc:
+                for request in collected:
+                    request.result_queue.put(("error", exc))
 
     def generate(
         self,
@@ -285,86 +361,108 @@ class ModelManager:
         self, prompt: str, max_new_tokens: int, temperature: float, top_p: float, top_k: int, seed: int, stream: bool
     ):
         """Generate using LLAISYS backend with KV cache reuse."""
-        # Encode prompt
+        if self.llaisys_use_dynamic_batch and not stream:
+            return self._generate_llaisys_dynamic_batch(
+                prompt, max_new_tokens, temperature, top_p, top_k, seed
+            )
+
         input_ids = self.tokenizer.encode(prompt)
 
-        # Check for KV cache prefix match
-        if self.cached_token_ids and len(input_ids) >= len(self.cached_token_ids) and \
-           input_ids[:len(self.cached_token_ids)] == self.cached_token_ids:
-            # Prefix matched, we can reuse KV cache
-            clear_kv_cache = False
-            # Only send the new tokens to the model
-            model_inputs = input_ids[len(self.cached_token_ids):]
-            print(f"KV cache matched. Reusing {len(self.cached_token_ids)} tokens, sending {len(model_inputs)} new tokens.")
-        else:
-            # No match or first request, reset cache
-            clear_kv_cache = True
-            model_inputs = input_ids
-            print("KV cache not matched or first request. Clearing cache.")
+        with self._llaisys_lock:
+            if self.cached_token_ids and len(input_ids) >= len(self.cached_token_ids) and \
+               input_ids[:len(self.cached_token_ids)] == self.cached_token_ids:
+                model_inputs = input_ids[len(self.cached_token_ids):]
+                print(f"KV cache matched. Reusing {len(self.cached_token_ids)} tokens, sending {len(model_inputs)} new tokens.")
+            else:
+                model_inputs = input_ids
+                self.llaisys_session.reset()
+                print("KV cache not matched or first request. Clearing cache.")
 
-        # IMPORTANT: Update cache list to include the newly sent tokens!
-        self.cached_token_ids = input_ids.copy()
+            self.cached_token_ids = input_ids.copy()
 
-        if stream:
-            # True streaming: backend yields token ids as they are generated.
-            def _token_generator():
-                for token_id in self.model.generate(
-                    model_inputs,
-                    max_new_tokens=max_new_tokens,
-                    top_k=top_k,
-                    top_p=top_p,
-                    temperature=temperature,
-                    seed=seed,
-                    stream=True,
-                    clear_kv_cache=clear_kv_cache,
-                ):
+            if stream:
+                def _token_generator():
+                    curr_inputs = list(model_inputs)
+                    for _ in range(max_new_tokens or 2048):
+                        token_id = self.llaisys_session.infer(
+                            curr_inputs,
+                            temperature=temperature,
+                            top_k=top_k,
+                            top_p=top_p,
+                            seed=seed,
+                        )
+                        token_id = int(token_id)
+                        self.cached_token_ids.append(token_id)
+                        token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
+                        yield token_text
+                        if token_id == self.model.end_token:
+                            break
+                        curr_inputs = [token_id]
+
+                return _token_generator()
+            else:
+                output_ids = list(model_inputs)
+                curr_inputs = list(model_inputs)
+                for _ in range(max_new_tokens or 2048):
+                    token_id = self.llaisys_session.infer(
+                        curr_inputs,
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                        seed=seed,
+                    )
+                    token_id = int(token_id)
+                    output_ids.append(token_id)
                     self.cached_token_ids.append(token_id)
-                    token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
-                    yield token_text
+                    if token_id == self.model.end_token:
+                        break
+                    curr_inputs = [token_id]
 
-            return _token_generator()
-        else:
-            output_ids = self.model.generate(
-                model_inputs,
-                max_new_tokens=max_new_tokens,
-                top_k=top_k,
-                top_p=top_p,
-                temperature=temperature,
-                seed=seed,
-                stream=False,
-                clear_kv_cache=clear_kv_cache,
-            )
-            # The output_ids includes the inputs we sent (model_inputs) + the new tokens.
-            # We want to extract only the generated tokens to append to our cache.
-            generated_ids = output_ids[len(model_inputs):]
-            self.cached_token_ids.extend(generated_ids)
-            
-            full_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
-            return full_text
+                full_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
+                return full_text
+
+    def _generate_llaisys_dynamic_batch(
+        self, prompt: str, max_new_tokens: int, temperature: float, top_p: float, top_k: int, seed: int
+    ):
+        input_ids = self.tokenizer.encode(prompt)
+        result_queue = Queue(maxsize=1)
+        self._llaisys_request_queue.put(_BatchRequest(
+            input_ids=list(input_ids),
+            max_completion_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            seed=seed,
+            ignore_eos=False,
+            result_queue=result_queue,
+        ))
+        status, payload = result_queue.get(timeout=self._llaisys_request_timeout_s)
+        if status == "error":
+            raise RuntimeError(f"LLAISYS dynamic batch request failed: {payload}") from payload
+        token_ids = payload
+        return self.tokenizer.decode(input_ids + token_ids, skip_special_tokens=True)
+
+
+@dataclass
+class _BatchRequest:
+    input_ids: List[int]
+    max_completion_tokens: int
+    temperature: float
+    top_k: int
+    top_p: float
+    seed: int
+    ignore_eos: bool
+    result_queue: Queue
 
 
 # ============================================================================
 # FastAPI Application
 # ============================================================================
 
-app = FastAPI(title="LLM Chat API", version="1.0.0")
-
-# Global model manager
 model_manager: Optional[ModelManager] = None
 
 
-def get_model_manager() -> ModelManager:
-    """Get or initialize the global model manager."""
-    global model_manager
-    if model_manager is None:
-        raise RuntimeError("Model manager not initialized")
-    return model_manager
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize model on startup."""
-    global model_manager
+def create_model_manager_from_env() -> ModelManager:
     device = os.environ.get("DEVICE", "cpu")
     model_path = os.environ.get("MODEL_PATH", None)
     model_id = os.environ.get("MODEL_ID", "Qwen/Qwen2.5-1.5B")
@@ -388,6 +486,30 @@ async def startup_event():
         seed=seed,
     )
     model_manager.load_model(model_id=model_id)
+    return model_manager
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global model_manager
+    model_manager = create_model_manager_from_env()
+    try:
+        yield
+    finally:
+        if model_manager is not None:
+            model_manager.shutdown()
+        model_manager = None
+
+
+app = FastAPI(title="LLM Chat API", version="1.0.0", lifespan=lifespan)
+
+
+def get_model_manager() -> ModelManager:
+    """Get or initialize the global model manager."""
+    global model_manager
+    if model_manager is None:
+        raise RuntimeError("Model manager not initialized")
+    return model_manager
 
 
 # ============================================================================
@@ -555,6 +677,8 @@ async def root():
 if __name__ == "__main__":
     import argparse
     import uvicorn
+
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
     parser = argparse.ArgumentParser(description="LLM Chat Server")
     parser.add_argument(

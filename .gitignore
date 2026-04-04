@@ -93,3 +93,7 @@ desktop.ini
 docs/*
 
 !docs/project.md
+
+nano-vllm/
+
+.codex

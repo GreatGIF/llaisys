@@ -38,6 +38,19 @@ __C {
     };
 
     struct LlaisysQwen2Model;
+    struct LlaisysQwen2Session;
+    struct LlaisysQwen2DynamicBatchEngine;
+
+    struct LlaisysQwen2FinishedSequence {
+        size_t seq_id;
+        int64_t *token_ids;
+        size_t ntoken;
+    };
+
+    struct LlaisysQwen2StepResult {
+        struct LlaisysQwen2FinishedSequence *sequences;
+        size_t nsequence;
+    };
 
     __export struct LlaisysQwen2Model *llaisysQwen2ModelCreate(const LlaisysQwen2Meta *meta, llaisysDeviceType_t device, int *device_ids, int ndevice);
 
@@ -49,5 +62,23 @@ __C {
 
     __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t *token_ids, size_t ntoken,
                                             const struct LlaisysQwen2SamplingParams *sampling_params);
+
+    __export struct LlaisysQwen2Session *llaisysQwen2SessionCreate(struct LlaisysQwen2Model *model, size_t seq_id);
+    __export void llaisysQwen2SessionDestroy(struct LlaisysQwen2Session *session);
+    __export void llaisysQwen2SessionReset(struct LlaisysQwen2Session *session);
+    __export int64_t llaisysQwen2SessionInfer(struct LlaisysQwen2Session *session, int64_t *token_ids, size_t ntoken,
+                                              const struct LlaisysQwen2SamplingParams *sampling_params);
+
+    __export struct LlaisysQwen2DynamicBatchEngine *llaisysQwen2DynamicBatchEngineCreate(
+        const LlaisysQwen2Meta *meta, llaisysDeviceType_t device, int *device_ids, int ndevice,
+        size_t max_num_seqs, size_t max_num_batched_tokens);
+    __export void llaisysQwen2DynamicBatchEngineDestroy(struct LlaisysQwen2DynamicBatchEngine *engine);
+    __export struct LlaisysQwen2Weights *llaisysQwen2DynamicBatchEngineWeights(struct LlaisysQwen2DynamicBatchEngine *engine);
+    __export size_t llaisysQwen2DynamicBatchEngineAddRequest(
+        struct LlaisysQwen2DynamicBatchEngine *engine, int64_t *token_ids, size_t ntoken,
+        size_t max_completion_tokens, const struct LlaisysQwen2SamplingParams *sampling_params, uint8_t ignore_eos);
+    __export struct LlaisysQwen2StepResult *llaisysQwen2DynamicBatchEngineStep(struct LlaisysQwen2DynamicBatchEngine *engine);
+    __export void llaisysQwen2StepResultDestroy(struct LlaisysQwen2StepResult *result);
+    __export uint8_t llaisysQwen2DynamicBatchEngineIsFinished(struct LlaisysQwen2DynamicBatchEngine *engine);
 }
 #endif // LLAISYS_MODELS_QWEN2_H
