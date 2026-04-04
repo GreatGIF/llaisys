@@ -63,6 +63,49 @@ __device__ __forceinline__ float uniform01(uint64_t &state) {
 	return static_cast<float>(splitmix64_next(state) >> 40) * inv_2pow24;
 }
 
+
+template <typename T>
+__global__ void sampling_top1_kernel(std::int64_t *out, const T *logits, size_t vocab_size) {
+	const size_t b = static_cast<size_t>(blockIdx.x);
+	const int tid = static_cast<int>(threadIdx.x);
+	const T *batch_logits = logits + b * vocab_size;
+
+	__shared__ float s_values[kBlockSize];
+	__shared__ int32_t s_indices[kBlockSize];
+
+	float local_best = -FLT_MAX;
+	int32_t local_idx = -1;
+	for (size_t i = static_cast<size_t>(tid); i < vocab_size; i += blockDim.x) {
+		const float v = llaisys::utils::cuda::to_float(batch_logits[i]);
+		if (v > local_best || (v == local_best && static_cast<int32_t>(i) < local_idx)) {
+			local_best = v;
+			local_idx = static_cast<int32_t>(i);
+		}
+	}
+
+	s_values[tid] = local_best;
+	s_indices[tid] = local_idx;
+	__syncthreads();
+
+	for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+		if (tid < stride) {
+			const float v0 = s_values[tid];
+			const float v1 = s_values[tid + stride];
+			const int32_t i0 = s_indices[tid];
+			const int32_t i1 = s_indices[tid + stride];
+			if (v1 > v0 || (v1 == v0 && i1 < i0)) {
+				s_values[tid] = v1;
+				s_indices[tid] = i1;
+			}
+		}
+		__syncthreads();
+	}
+
+	if (tid == 0) {
+		out[b] = static_cast<std::int64_t>(s_indices[0]);
+	}
+}
+
 template <typename T>
 __global__ void sampling_kernel(std::int64_t *out, const T *logits, float *workspace_logits,
 								float *workspace_selected_logits, int32_t *workspace_selected_indices,
@@ -298,11 +341,39 @@ void sampling(std::byte *out, const std::byte *logits, llaisysDataType_t type,
 
 	const size_t n_elem = batch_size * vocab_size;
 
-	std::lock_guard<std::mutex> lock(g_sampling_workspace_mutex);
-	ensure_sampling_workspace(n_elem);
-
 	dim3 grid(static_cast<unsigned int>(batch_size));
 	dim3 block(kBlockSize);
+
+	if (top_k == 1) {
+		switch (type) {
+		case LLAISYS_DTYPE_F32:
+			sampling_top1_kernel<<<grid, block>>>(reinterpret_cast<std::int64_t *>(out),
+				reinterpret_cast<const float *>(logits), vocab_size);
+			break;
+		case LLAISYS_DTYPE_BF16:
+			sampling_top1_kernel<<<grid, block>>>(reinterpret_cast<std::int64_t *>(out),
+				reinterpret_cast<const nv_bfloat16 *>(logits), vocab_size);
+			break;
+		case LLAISYS_DTYPE_F16:
+			sampling_top1_kernel<<<grid, block>>>(reinterpret_cast<std::int64_t *>(out),
+				reinterpret_cast<const half *>(logits), vocab_size);
+			break;
+		default:
+			EXCEPTION_UNSUPPORTED_DATATYPE(type);
+		}
+
+		LLAISYS_CUDA_CHECK(cudaGetLastError());
+		return;
+	}
+
+	// NOTE:
+	// The single-thread heap path can become a severe bottleneck on large vocab
+	// (e.g. >100k). Keep using the parallel sampling kernel for top_k > 1.
+
+	if (n_elem > g_workspace_capacity) {
+		std::lock_guard<std::mutex> lock(g_sampling_workspace_mutex);
+		ensure_sampling_workspace(n_elem);
+	}
 
 	switch (type) {
 	case LLAISYS_DTYPE_F32:

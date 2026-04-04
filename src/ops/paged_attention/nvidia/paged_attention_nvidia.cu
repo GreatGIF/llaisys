@@ -9,6 +9,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <vector>
 
 namespace {
@@ -140,59 +141,104 @@ __global__ void paged_attention_decode_kernel(
     const int32_t *context_lens, const int32_t *block_tables, size_t max_block_count,
     size_t batch_size, size_t num_heads, size_t num_kv_heads, size_t head_dim,
     float scale, size_t block_size) {
-    const size_t total = batch_size * num_heads;
-    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= total) {
+    const size_t head = static_cast<size_t>(blockIdx.x);
+    const size_t seq_idx = static_cast<size_t>(blockIdx.y);
+    const size_t tid = static_cast<size_t>(threadIdx.x);
+
+    if (head >= num_heads || seq_idx >= batch_size) {
         return;
     }
-    const size_t head = idx % num_heads;
-    const size_t seq_idx = idx / num_heads;
+
     const size_t kv_len = static_cast<size_t>(context_lens[seq_idx]);
+    if (kv_len == 0) {
+        for (size_t d = tid; d < head_dim; d += blockDim.x) {
+            const size_t out_idx = (seq_idx * num_heads + head) * head_dim + d;
+            attn_val[out_idx] = llaisys::utils::cuda::from_float<T>(0.0f);
+        }
+        return;
+    }
+
     const size_t group_size = num_heads / num_kv_heads;
     const size_t kv_head = head / group_size;
     const int32_t *table = block_tables + seq_idx * max_block_count;
 
-    float max_score = -1.0e30f;
-    for (size_t kv_pos = 0; kv_pos < kv_len; ++kv_pos) {
-        const size_t slot = static_cast<size_t>(slot_for_position_device(table, kv_pos, block_size));
-        float score = 0.0f;
-        for (size_t d = 0; d < head_dim; ++d) {
-            const size_t q_idx = (seq_idx * num_heads + head) * head_dim + d;
-            const size_t k_idx = (slot * num_kv_heads + kv_head) * head_dim + d;
-            score += llaisys::utils::cuda::to_float(q[q_idx]) * llaisys::utils::cuda::to_float(k_cache[k_idx]);
+    constexpr int kMaxVecPerThread = 8;
+    float q_local[kMaxVecPerThread];
+    float acc_local[kMaxVecPerThread];
+    int valid_count = 0;
+
+    const size_t q_base = (seq_idx * num_heads + head) * head_dim;
+    for (int i = 0; i < kMaxVecPerThread; ++i) {
+        const size_t d = tid + static_cast<size_t>(i) * blockDim.x;
+        if (d < head_dim) {
+            q_local[i] = llaisys::utils::cuda::to_float(q[q_base + d]);
+            acc_local[i] = 0.0f;
+            ++valid_count;
+        } else {
+            q_local[i] = 0.0f;
+            acc_local[i] = 0.0f;
         }
-        score *= scale;
-        max_score = fmaxf(max_score, score);
     }
 
-    float sum = 0.0f;
+    __shared__ float s_reduce[256];
+    __shared__ float s_m;
+    __shared__ float s_l;
+    __shared__ float s_alpha;
+    __shared__ float s_beta;
+
+    if (tid == 0) {
+        s_m = -1.0e30f;
+        s_l = 0.0f;
+        s_alpha = 0.0f;
+        s_beta = 0.0f;
+    }
+    __syncthreads();
+
     for (size_t kv_pos = 0; kv_pos < kv_len; ++kv_pos) {
         const size_t slot = static_cast<size_t>(slot_for_position_device(table, kv_pos, block_size));
-        float score = 0.0f;
-        for (size_t d = 0; d < head_dim; ++d) {
-            const size_t q_idx = (seq_idx * num_heads + head) * head_dim + d;
-            const size_t k_idx = (slot * num_kv_heads + kv_head) * head_dim + d;
-            score += llaisys::utils::cuda::to_float(q[q_idx]) * llaisys::utils::cuda::to_float(k_cache[k_idx]);
-        }
-        sum += expf(score * scale - max_score);
-    }
+        const size_t k_base = (slot * num_kv_heads + kv_head) * head_dim;
+        const size_t v_base = (slot * num_kv_heads + kv_head) * head_dim;
 
-    for (size_t d = 0; d < head_dim; ++d) {
-        float acc = 0.0f;
-        for (size_t kv_pos = 0; kv_pos < kv_len; ++kv_pos) {
-            const size_t slot = static_cast<size_t>(slot_for_position_device(table, kv_pos, block_size));
-            float score = 0.0f;
-            for (size_t inner = 0; inner < head_dim; ++inner) {
-                const size_t q_idx = (seq_idx * num_heads + head) * head_dim + inner;
-                const size_t k_idx = (slot * num_kv_heads + kv_head) * head_dim + inner;
-                score += llaisys::utils::cuda::to_float(q[q_idx]) * llaisys::utils::cuda::to_float(k_cache[k_idx]);
+        float dot_partial = 0.0f;
+        for (int i = 0; i < valid_count; ++i) {
+            const size_t d = tid + static_cast<size_t>(i) * blockDim.x;
+            dot_partial += q_local[i] * llaisys::utils::cuda::to_float(k_cache[k_base + d]);
+        }
+
+        s_reduce[tid] = dot_partial;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < static_cast<size_t>(stride)) {
+                s_reduce[tid] += s_reduce[tid + stride];
             }
-            const float prob = expf(score * scale - max_score) / sum;
-            const size_t v_idx = (slot * num_kv_heads + kv_head) * head_dim + d;
-            acc += prob * llaisys::utils::cuda::to_float(v_cache[v_idx]);
+            __syncthreads();
         }
-        const size_t out_idx = (seq_idx * num_heads + head) * head_dim + d;
-        attn_val[out_idx] = llaisys::utils::cuda::from_float<T>(acc);
+
+        if (tid == 0) {
+            const float score = s_reduce[0] * scale;
+            const float m_new = fmaxf(s_m, score);
+            const float alpha = expf(s_m - m_new);
+            const float beta = expf(score - m_new);
+            s_l = s_l * alpha + beta;
+            s_m = m_new;
+            s_alpha = alpha;
+            s_beta = beta;
+        }
+        __syncthreads();
+
+        for (int i = 0; i < valid_count; ++i) {
+            const size_t d = tid + static_cast<size_t>(i) * blockDim.x;
+            const float vv = llaisys::utils::cuda::to_float(v_cache[v_base + d]);
+            acc_local[i] = acc_local[i] * s_alpha + s_beta * vv;
+        }
+        __syncthreads();
+    }
+
+    const float inv_l = 1.0f / fmaxf(s_l, 1e-12f);
+    const size_t out_base = (seq_idx * num_heads + head) * head_dim;
+    for (int i = 0; i < valid_count; ++i) {
+        const size_t d = tid + static_cast<size_t>(i) * blockDim.x;
+        attn_val[out_base + d] = llaisys::utils::cuda::from_float<T>(acc_local[i] * inv_l);
     }
 }
 
@@ -294,10 +340,9 @@ void paged_attention_decode_impl(
     LLAISYS_CUDA_CHECK(cudaMemcpyAsync(d_context_lens, batch.context_lens.data(), batch.context_lens.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     LLAISYS_CUDA_CHECK(cudaMemcpyAsync(d_tables, host_block_tables.data(), host_block_tables.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
-    const size_t total = batch_size * num_heads;
-    const int threads = 128;
-    const int blocks = static_cast<int>((total + threads - 1) / threads);
-    paged_attention_decode_kernel<<<blocks, threads, 0, stream>>>(
+    const int threads = static_cast<int>(std::min<size_t>(256, std::max<size_t>(32, head_dim)));
+    dim3 grid(static_cast<unsigned int>(num_heads), static_cast<unsigned int>(batch_size));
+    paged_attention_decode_kernel<<<grid, threads, 0, stream>>>(
         reinterpret_cast<T *>(attn_val), reinterpret_cast<const T *>(q),
         reinterpret_cast<const T *>(k_cache), reinterpret_cast<const T *>(v_cache),
         d_context_lens, d_tables, max_block_count, batch_size,

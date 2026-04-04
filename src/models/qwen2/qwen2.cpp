@@ -11,9 +11,36 @@
 #include "../../device/runtime_api.hpp"
 #include "../../utils.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <cstdio>
+#include <functional>
+#include <string>
+#include <unordered_map>
 namespace llaisys::models {
+
+namespace {
+
+bool env_is_true(const char *v) {
+    if (v == nullptr) {
+        return false;
+    }
+    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+           std::strcmp(v, "TRUE") == 0 || std::strcmp(v, "on") == 0 ||
+           std::strcmp(v, "ON") == 0 || std::strcmp(v, "yes") == 0 ||
+           std::strcmp(v, "YES") == 0;
+}
+
+bool is_ops_profile_enabled() {
+    // Default: disabled to avoid profiling/sync overhead in normal inference.
+    // Enable by setting LLAISYS_OP_PROFILE=1 (or true/on/yes).
+    static const bool enabled = env_is_true(std::getenv("LLAISYS_OP_PROFILE"));
+    return enabled;
+}
+
+} // namespace
 
 Qwen2Model::Qwen2Model(const LlaisysQwen2Meta &meta, llaisysDeviceType_t device, int *device_ids, int ndevice)
     : _meta(meta), _device_type(device), _device_id(device_ids[0]) {
@@ -219,6 +246,34 @@ std::vector<int64_t> Qwen2Model::infer_batch(
         CHECK_ARGUMENT(q_token_count <= _meta.maxseq,
                        "Qwen2Model::infer_batch: q_token_count exceeds preallocated model buffers");
 
+        const LlaisysRuntimeAPI *api = device::getRuntimeAPI(_device_type);
+        const bool enable_profile = is_ops_profile_enabled();
+        using Clock = std::chrono::steady_clock;
+        std::unordered_map<std::string, double> op_time_ms;
+        std::vector<std::string> op_order;
+        double total_profile_ms = 0.0;
+        std::function<void(const char *, const std::function<void()> &)> profile_op =
+            [&](const char *op_name, const std::function<void()> &op_func) {
+                if (!enable_profile) {
+                    op_func();
+                    return;
+                }
+                auto t0 = Clock::now();
+                op_func();
+                api->device_synchronize();
+                auto t1 = Clock::now();
+
+                const double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                auto it = op_time_ms.find(op_name);
+                if (it == op_time_ms.end()) {
+                    op_order.emplace_back(op_name);
+                    op_time_ms.emplace(op_name, elapsed_ms);
+                } else {
+                    it->second += elapsed_ms;
+                }
+                total_profile_ms += elapsed_ms;
+            };
+
         auto tokens_cpu = Tensor::create({q_token_count}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU, 0);
         tokens_cpu->load(compute_input_ids.data());
         auto pos_ids_cpu = Tensor::create({q_token_count}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU, 0);
@@ -227,66 +282,129 @@ std::vector<int64_t> Qwen2Model::infer_batch(
         auto pos_ids = (_device_type == LLAISYS_DEVICE_CPU) ? pos_ids_cpu : pos_ids_cpu->to(_device_type, _device_id);
 
         auto x = _x->view({q_token_count, _meta.hs});
-        ops::embedding(x, tokens_device, _in_embed);
+        profile_op("embedding", [&]() {
+            ops::embedding(x, tokens_device, _in_embed);
+        });
 
         for (size_t layer = 0; layer < _meta.nlayer; ++layer) {
             auto residual = x;
             auto x_norm = _x_norm->view({q_token_count, _meta.hs});
-            ops::rms_norm(x_norm, x, _attn_norm_w[layer], _meta.epsilon);
+            profile_op("rms_norm", [&]() {
+                ops::rms_norm(x_norm, x, _attn_norm_w[layer], _meta.epsilon);
+            });
 
             auto q = _q->view({q_token_count, _meta.nh, _meta.dh});
             auto k = _k->view({q_token_count, _meta.nkvh, _meta.dh});
             auto v = _v->view({q_token_count, _meta.nkvh, _meta.dh});
 
-            ops::linear(q->view({q_token_count, _meta.nh * _meta.dh}), x_norm, _attn_q_w[layer], _attn_q_b[layer]);
-            ops::linear(k->view({q_token_count, _meta.nkvh * _meta.dh}), x_norm, _attn_k_w[layer], _attn_k_b[layer]);
-            ops::linear(v->view({q_token_count, _meta.nkvh * _meta.dh}), x_norm, _attn_v_w[layer], _attn_v_b[layer]);
+            profile_op("linear", [&]() {
+                ops::linear(q->view({q_token_count, _meta.nh * _meta.dh}), x_norm, _attn_q_w[layer], _attn_q_b[layer]);
+            });
+            profile_op("linear", [&]() {
+                ops::linear(k->view({q_token_count, _meta.nkvh * _meta.dh}), x_norm, _attn_k_w[layer], _attn_k_b[layer]);
+            });
+            profile_op("linear", [&]() {
+                ops::linear(v->view({q_token_count, _meta.nkvh * _meta.dh}), x_norm, _attn_v_w[layer], _attn_v_b[layer]);
+            });
 
             auto q_rope = q;
             auto k_rope = k;
-            ops::rope(q_rope, q, pos_ids, _meta.theta);
-            ops::rope(k_rope, k, pos_ids, _meta.theta);
+            profile_op("rope", [&]() {
+                ops::rope(q_rope, q, pos_ids, _meta.theta);
+            });
+            profile_op("rope", [&]() {
+                ops::rope(k_rope, k, pos_ids, _meta.theta);
+            });
 
             const auto &slot_mapping = group_is_prefill ? prefill_batch.slot_mapping : decode_batch.slot_mapping;
-            ops::store_paged_kv_cache(runtime_state.kCache(layer), runtime_state.vCache(layer), k_rope, v, slot_mapping);
+            profile_op("store_paged_kv_cache", [&]() {
+                ops::store_paged_kv_cache(runtime_state.kCache(layer), runtime_state.vCache(layer), k_rope, v, slot_mapping);
+            });
 
             auto attn_out = _attn_out->view({q_token_count, _meta.nh, _meta.dh});
             if (group_is_prefill) {
-                ops::paged_attention_prefill(attn_out, q_rope, runtime_state.kCache(layer), runtime_state.vCache(layer),
-                                             prefill_batch, _meta.nkvh,
-                                             1.0f / sqrtf(static_cast<float>(_meta.dh)));
+                profile_op("paged_attention_prefill", [&]() {
+                    ops::paged_attention_prefill(attn_out, q_rope, runtime_state.kCache(layer), runtime_state.vCache(layer),
+                                                 prefill_batch, _meta.nkvh,
+                                                 1.0f / sqrtf(static_cast<float>(_meta.dh)));
+                });
             } else {
-                ops::paged_attention_decode(attn_out, q_rope, runtime_state.kCache(layer), runtime_state.vCache(layer),
-                                            decode_batch, _meta.nkvh,
-                                            1.0f / sqrtf(static_cast<float>(_meta.dh)));
+                profile_op("paged_attention_decode", [&]() {
+                    ops::paged_attention_decode(attn_out, q_rope, runtime_state.kCache(layer), runtime_state.vCache(layer),
+                                                decode_batch, _meta.nkvh,
+                                                1.0f / sqrtf(static_cast<float>(_meta.dh)));
+                });
             }
 
             auto attn_proj = _attn_proj->view({q_token_count, _meta.hs});
-            ops::linear(attn_proj, attn_out->view({q_token_count, _meta.nh * _meta.dh}), _attn_o_w[layer], nullptr);
-            ops::add(x, residual, attn_proj);
+            profile_op("linear", [&]() {
+                ops::linear(attn_proj, attn_out->view({q_token_count, _meta.nh * _meta.dh}), _attn_o_w[layer], nullptr);
+            });
+            profile_op("add", [&]() {
+                ops::add(x, residual, attn_proj);
+            });
 
             residual = x;
             auto x_norm_mlp = _x_norm_mlp->view({q_token_count, _meta.hs});
-            ops::rms_norm(x_norm_mlp, x, _mlp_norm_w[layer], _meta.epsilon);
+            profile_op("rms_norm", [&]() {
+                ops::rms_norm(x_norm_mlp, x, _mlp_norm_w[layer], _meta.epsilon);
+            });
 
             auto gate = _mlp_gate->view({q_token_count, _meta.di});
             auto up = _mlp_up->view({q_token_count, _meta.di});
-            ops::linear(gate, x_norm_mlp, _mlp_gate_w[layer], nullptr);
-            ops::linear(up, x_norm_mlp, _mlp_up_w[layer], nullptr);
+            profile_op("linear", [&]() {
+                ops::linear(gate, x_norm_mlp, _mlp_gate_w[layer], nullptr);
+            });
+            profile_op("linear", [&]() {
+                ops::linear(up, x_norm_mlp, _mlp_up_w[layer], nullptr);
+            });
 
             auto mlp_gate_out = _mlp_gate_out->view({q_token_count, _meta.di});
-            ops::swiglu(mlp_gate_out, gate, up);
+            profile_op("swiglu", [&]() {
+                ops::swiglu(mlp_gate_out, gate, up);
+            });
 
             auto mlp_down_out = _mlp_down_out->view({q_token_count, _meta.hs});
-            ops::linear(mlp_down_out, mlp_gate_out, _mlp_down_w[layer], nullptr);
-            ops::add(x, residual, mlp_down_out);
+            profile_op("linear", [&]() {
+                ops::linear(mlp_down_out, mlp_gate_out, _mlp_down_w[layer], nullptr);
+            });
+            profile_op("add", [&]() {
+                ops::add(x, residual, mlp_down_out);
+            });
         }
 
         for (auto *sequence : group_sequences) {
             sequence->setNumCachedTokens(sequence->numTokens());
         }
 
-        return sample_from_hidden(x, last_token_indices, group_params);
+        // NOTE: sample_from_hidden internally profiles its own sub-ops
+        // (gather_last_hidden/rms_norm/linear/sampling). Wrapping it again
+        // here would double count and distort total percentage.
+        std::vector<int64_t> sampled_tokens = sample_from_hidden(
+            x, last_token_indices, group_params, enable_profile ? &profile_op : nullptr);
+
+        if (enable_profile) {
+            const char *group_name = group_is_prefill ? "prefill" : "decode";
+            const double total_per_token_ms = total_profile_ms / static_cast<double>(q_token_count);
+            printf("[Qwen2Model::infer_batch][%s] seq=%zu q_tokens=%zu total=%.3f ms (%.3f ms/token)\n",
+                   group_name,
+                   group_sequences.size(),
+                   q_token_count,
+                   total_profile_ms,
+                   total_per_token_ms);
+            for (const auto &op_name : op_order) {
+                const double ms = op_time_ms[op_name];
+                const double per_token_ms = ms / static_cast<double>(q_token_count);
+                const double ratio = total_profile_ms > 0.0 ? (ms * 100.0 / total_profile_ms) : 0.0;
+                printf("  %-24s : %10.3f ms (%7.3f ms/token, %6.2f%%)\n",
+                       op_name.c_str(),
+                       ms,
+                       per_token_ms,
+                       ratio);
+            }
+        }
+
+        return sampled_tokens;
     };
 
     const auto prefill_outputs = run_group(prefill_sequences, prefill_params, true);
@@ -305,7 +423,8 @@ std::vector<int64_t> Qwen2Model::infer_batch(
 std::vector<int64_t> Qwen2Model::sample_from_hidden(
     tensor_t hidden_states,
     const std::vector<size_t> &last_token_indices,
-    const std::vector<LlaisysQwen2SamplingParams> &params) {
+    const std::vector<LlaisysQwen2SamplingParams> &params,
+    const std::function<void(const char *, const std::function<void()> &)> *profile_op) {
     CHECK_ARGUMENT(last_token_indices.size() == params.size(),
                    "Qwen2Model::sample_from_hidden: indices/params size mismatch");
     const size_t batch_size = last_token_indices.size();
@@ -316,23 +435,39 @@ std::vector<int64_t> Qwen2Model::sample_from_hidden(
     const auto *src = hidden_states->data();
     auto *dst = x_last->data();
     const LlaisysRuntimeAPI *api = device::getRuntimeAPI(_device_type);
-    for (size_t i = 0; i < batch_size; ++i) {
-        const size_t row = last_token_indices[i];
-        api->memcpy_sync(dst + i * row_bytes, src + row * row_bytes, row_bytes, LLAISYS_MEMCPY_D2D);
-    }
+    auto run_or_profile = [&](const char *name, const std::function<void()> &fn) {
+        if (profile_op != nullptr) {
+            (*profile_op)(name, fn);
+        } else {
+            fn();
+        }
+    };
+
+    run_or_profile("gather_last_hidden", [&]() {
+        for (size_t i = 0; i < batch_size; ++i) {
+            const size_t row = last_token_indices[i];
+            api->memcpy_sync(dst + i * row_bytes, src + row * row_bytes, row_bytes, LLAISYS_MEMCPY_D2D);
+        }
+    });
 
     auto x_last_norm = Tensor::create({batch_size, _meta.hs}, _meta.dtype, _device_type, _device_id);
-    ops::rms_norm(x_last_norm, x_last, _out_norm_w, _meta.epsilon);
+    run_or_profile("rms_norm", [&]() {
+        ops::rms_norm(x_last_norm, x_last, _out_norm_w, _meta.epsilon);
+    });
 
     auto logits = Tensor::create({batch_size, _meta.voc}, _meta.dtype, _device_type, _device_id);
-    ops::linear(logits, x_last_norm, _out_embed, nullptr);
+    run_or_profile("linear", [&]() {
+        ops::linear(logits, x_last_norm, _out_embed, nullptr);
+    });
 
     auto next_token_idx = Tensor::create({batch_size}, LLAISYS_DTYPE_I64, _device_type, _device_id);
-    for (size_t i = 0; i < batch_size; ++i) {
-        auto logits_row = logits->slice(0, i, i + 1);
-        auto token_row = next_token_idx->slice(0, i, i + 1);
-        ops::sampling(token_row, logits_row, params[i].temperature, params[i].top_k, params[i].top_p, params[i].seed);
-    }
+    run_or_profile("sampling", [&]() {
+        for (size_t i = 0; i < batch_size; ++i) {
+            auto logits_row = logits->slice(0, i, i + 1);
+            auto token_row = next_token_idx->slice(0, i, i + 1);
+            ops::sampling(token_row, logits_row, params[i].temperature, params[i].top_k, params[i].top_p, params[i].seed);
+        }
+    });
 
     auto next_token_idx_cpu = (_device_type == LLAISYS_DEVICE_CPU) ? next_token_idx : next_token_idx->to(LLAISYS_DEVICE_CPU, 0);
     const int64_t *tokens = reinterpret_cast<const int64_t *>(next_token_idx_cpu->data());

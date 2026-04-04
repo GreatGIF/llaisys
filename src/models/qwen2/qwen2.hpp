@@ -4,6 +4,7 @@
 #include "../../core/scheduler/scheduler.hpp"
 #include "../../tensor/tensor.hpp"
 #include "qwen2_runtime_state.hpp"
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -42,7 +43,8 @@ private:
     std::vector<int64_t> sample_from_hidden(
         tensor_t hidden_states,
         const std::vector<size_t> &last_token_indices,
-        const std::vector<LlaisysQwen2SamplingParams> &params);
+        const std::vector<LlaisysQwen2SamplingParams> &params,
+        const std::function<void(const char *, const std::function<void()> &)> *profile_op = nullptr);
 
     LlaisysQwen2Meta _meta;
     LlaisysQwen2Weights _weights_c;
